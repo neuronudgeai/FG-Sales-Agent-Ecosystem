@@ -643,40 +643,40 @@ class StageGateManager:
         StageGateName.CHARTER_APPROVAL: StageGate(
             name=StageGateName.CHARTER_APPROVAL,
             description="Project Charter Review & Approval",
-            approver_email="trice@firstgenesis.com",
-            cc_emails=["elina@firstgenesis.com"],
+            approver_email="tjohnson@firstgenesis.com",
+            cc_emails=[],
             require_comment=False,
             timeout_hours=24
         ),
         StageGateName.REQUIREMENTS_APPROVAL: StageGate(
             name=StageGateName.REQUIREMENTS_APPROVAL,
             description="Requirements Specification Review",
-            approver_email="kiera@firstgenesis.com",
-            cc_emails=["trice@firstgenesis.com"],
+            approver_email="k.phipps@firstgenesis.com",
+            cc_emails=[],
             require_comment=True,
             timeout_hours=12
         ),
         StageGateName.QA_AUDIT_APPROVAL: StageGate(
             name=StageGateName.QA_AUDIT_APPROVAL,
             description="QA Audit & Pre-Delivery Approval",
-            approver_email="trice@firstgenesis.com",
-            cc_emails=["kiera@firstgenesis.com"],
+            approver_email="emaiteu@firstgenesis.com",
+            cc_emails=["tjohnson@firstgenesis.com"],
             require_comment=False,
             timeout_hours=6
         ),
         StageGateName.DELIVERY_APPROVAL: StageGate(
             name=StageGateName.DELIVERY_APPROVAL,
             description="Final Approval Before Customer Delivery",
-            approver_email="kiera@firstgenesis.com",
-            cc_emails=["trice@firstgenesis.com", "elina@firstgenesis.com"],
+            approver_email="tjohnson@firstgenesis.com",
+            cc_emails=["pwatty@firstgenesis.com"],
             require_comment=True,
             timeout_hours=2
         ),
         StageGateName.BUDGET_ESCALATION: StageGate(
             name=StageGateName.BUDGET_ESCALATION,
             description="Budget Alert - Approval to Continue",
-            approver_email="pascal@firstgenesis.com",
-            cc_emails=["kiera@firstgenesis.com"],
+            approver_email="pwatty@firstgenesis.com",
+            cc_emails=["emaiteu@firstgenesis.com"],
             require_comment=True,
             timeout_hours=1
         )
