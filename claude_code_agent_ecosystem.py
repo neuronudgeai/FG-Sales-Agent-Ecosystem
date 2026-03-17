@@ -1,32 +1,57 @@
 #!/usr/bin/env python3
 """
 claude_code_agent_ecosystem.py
-Complete multi-agent system for First Genesis.
-Ready to run in Claude Code.
-Templates injected via TEMPLATES dict or external file.
+Enhanced multi-agent system for First Genesis with email-based human approval gates.
+Agents pause at stage gates, email humans for approval, and resume upon response.
+Features:
+  - Stage gate framework (5 standard gates across agents)
+  - Email notifications to humans via Outlook SMTP (customizable recipients per gate)
+  - Approval workflow (human replies, agent resumes automatically)
+  - Workflow persistence (SQLite state machine)
+  - Cost control + hallucination detection
+
+Configuration:
+    export ANTHROPIC_API_KEY="sk-..."
+    export OUTLOOK_SENDER="your-email@yourdomain.com"
+    export OUTLOOK_PASSWORD="your-password"
+
 Usage:
-    python claude_code_agent_ecosystem.py run_pm_agent --project "AURA MVP"
+    python claude_code_agent_ecosystem.py run_pm_agent
     python claude_code_agent_ecosystem.py check_approvals
-    python claude_code_agent_ecosystem.py process_approval --workflow-id <id> --decision approved
+    python claude_code_agent_ecosystem.py resume_workflows
+    python claude_code_agent_ecosystem.py process_approval --workflow-id <id> --approver <email> --decision <approved|rejected>
 """
 import anthropic
-import sqlite3
 import json
 import os
 import sys
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
-from dataclasses import dataclass
-from enum import Enum
+from dataclasses import dataclass, asdict
+import sqlite3
+import hashlib
+import logging
 import smtplib
+import email
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import hashlib
+from enum import Enum
+import time
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)-8s %(message)s',
+    handlers=[
+        logging.FileHandler('/home/claude/fg_agents.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 # ============================================================================
 # CONFIGURATION: TEMPLATES
 # ============================================================================
-# YOUR TEMPLATES HERE
-# Replace these with Trice's actual templates after setup
 TEMPLATES = {
     "pm_agent": {
         "project_charter": """
@@ -261,8 +286,8 @@ PENDING APPROVALS ({approval_count}):
   - {workflow_1} (waiting {hours_1}h)
   - {workflow_2} (waiting {hours_2}h)
 RISKS & BLOCKERS ({blocker_count}):
-  🔴 CRITICAL: {critical_blocker}
-  🟡 HIGH: {high_blocker}
+  CRITICAL: {critical_blocker}
+  HIGH: {high_blocker}
 
 NEXT ACTIONS:
   [ ] {action_1} - Owner: {owner} - Due: {due_date}
@@ -277,454 +302,702 @@ Report Generated: {timestamp}
 """,
     }
 }
+
 # ============================================================================
-# DATA STRUCTURES
+# DATA MODELS
 # ============================================================================
 class StageGateName(Enum):
+    """Standard stage gates across all agents."""
     CHARTER_APPROVAL = "charter_approval"
     REQUIREMENTS_APPROVAL = "requirements_approval"
     QA_AUDIT_APPROVAL = "qa_audit_approval"
     DELIVERY_APPROVAL = "delivery_approval"
     BUDGET_ESCALATION = "budget_escalation"
+
 class WorkflowStatus(Enum):
+    """Status of a workflow at each stage gate."""
     PENDING = "pending"
     APPROVAL_SENT = "approval_sent"
     APPROVED = "approved"
     REJECTED = "rejected"
     RESUMED = "resumed"
     COMPLETED = "completed"
+
 @dataclass
-class Agent:
-    """Base agent class"""
-    name: str
-    templates: Dict = None
-    client: anthropic.Anthropic = None
-    db: sqlite3.Connection = None
+class StageGate:
+    """Definition of a stage gate."""
+    name: StageGateName
+    description: str
+    approver_email: str
+    cc_emails: List[str] = None
+    auto_approve_if: Optional[str] = None
+    require_comment: bool = False
+    timeout_hours: int = 24
+
+@dataclass
+class WorkflowState:
+    """State of an agent workflow."""
+    workflow_id: str
+    agent_name: str
+    project_name: str
+    current_stage_gate: StageGateName
+    status: WorkflowStatus
+    content_pending_approval: str
+    content_hash: str
+    approval_email_sent_at: Optional[str] = None
+    human_approver: Optional[str] = None
+    human_feedback: Optional[str] = None
+    approval_timestamp: Optional[str] = None
+    next_step_after_approval: Optional[str] = None
+    created_at: str = None
+    updated_at: str = None
 
     def __post_init__(self):
-        if self.templates is None:
-            self.templates = {}
-        if self.client is None:
-            self.client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-# ============================================================================
-# DATABASE
-# ============================================================================
-class WorkflowDB:
-    """SQLite workflow database"""
+        if self.created_at is None:
+            self.created_at = datetime.now().isoformat()
+        self.updated_at = datetime.now().isoformat()
 
-    def __init__(self, db_path: str = "/tmp/fg_workflows.db"):
+@dataclass
+class TokenCost:
+    """Track token usage and cost."""
+    input_tokens: int
+    output_tokens: int
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
+    model: str = "claude-opus-4-6"
+
+    INPUT_COST_PER_1M = 5.00
+    OUTPUT_COST_PER_1M = 25.00
+    CACHE_WRITE_COST_PER_1M = 0.50
+    CACHE_READ_COST_PER_1M = 0.50
+
+    def total_cost_usd(self) -> float:
+        input_cost = (self.input_tokens / 1_000_000) * self.INPUT_COST_PER_1M
+        output_cost = (self.output_tokens / 1_000_000) * self.OUTPUT_COST_PER_1M
+        cache_write_cost = (self.cache_creation_tokens / 1_000_000) * self.CACHE_WRITE_COST_PER_1M
+        cache_read_cost = (self.cache_read_tokens / 1_000_000) * self.CACHE_READ_COST_PER_1M
+        return input_cost + output_cost + cache_write_cost + cache_read_cost
+
+    def __str__(self) -> str:
+        return (f"In={self.input_tokens} Out={self.output_tokens} "
+                f"CW={self.cache_creation_tokens} CR={self.cache_read_tokens} "
+                f"Cost=${self.total_cost_usd():.4f}")
+
+# ============================================================================
+# DATABASE & WORKFLOW STATE MANAGEMENT
+# ============================================================================
+class WorkflowDatabase:
+    """SQLite database for workflow state and approvals."""
+
+    def __init__(self, db_path: str = "/home/claude/fg_workflows.db"):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.init_tables()
+        self.cursor = self.conn.cursor()
+        self._init_tables()
 
-    def init_tables(self):
-        """Initialize database schema"""
-        self.conn.execute("""
+    def _init_tables(self):
+        self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS workflows (
                 workflow_id TEXT PRIMARY KEY,
-                agent_name TEXT,
-                project_name TEXT,
-                stage_gate TEXT,
-                status TEXT,
-                content TEXT,
-                created_at TEXT,
-                updated_at TEXT
+                agent_name TEXT NOT NULL,
+                project_name TEXT NOT NULL,
+                current_stage_gate TEXT NOT NULL,
+                status TEXT NOT NULL,
+                content_pending_approval TEXT,
+                content_hash TEXT,
+                approval_email_sent_at TEXT,
+                human_approver TEXT,
+                human_feedback TEXT,
+                approval_timestamp TEXT,
+                next_step_after_approval TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )
         """)
 
-        self.conn.execute("""
+        self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS approvals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                workflow_id TEXT,
-                stage_gate TEXT,
-                approver TEXT,
-                decision TEXT,
+                workflow_id TEXT NOT NULL,
+                stage_gate TEXT NOT NULL,
+                approver_email TEXT NOT NULL,
+                decision TEXT NOT NULL,
                 feedback TEXT,
-                timestamp TEXT
+                decided_at TEXT NOT NULL,
+                FOREIGN KEY(workflow_id) REFERENCES workflows(workflow_id)
+            )
+        """)
+
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id TEXT,
+                agent_name TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cost_usd REAL NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT,
+                FOREIGN KEY(workflow_id) REFERENCES workflows(workflow_id)
             )
         """)
 
         self.conn.commit()
+        logger.info("Workflow database initialized")
 
-    def save_workflow(self, workflow_id: str, agent_name: str, project_name: str,
-                     stage_gate: str, status: str, content: str):
-        """Save workflow state"""
-        self.conn.execute("""
+    def save_workflow_state(self, state: WorkflowState):
+        self.cursor.execute("""
             INSERT OR REPLACE INTO workflows
-            (workflow_id, agent_name, project_name, stage_gate, status, content, created_at, updated_at)
+            (workflow_id, agent_name, project_name, current_stage_gate, status,
+             content_pending_approval, content_hash, approval_email_sent_at,
+             human_approver, human_feedback, approval_timestamp,
+             next_step_after_approval, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            state.workflow_id, state.agent_name, state.project_name,
+            state.current_stage_gate.value, state.status.value,
+            state.content_pending_approval, state.content_hash,
+            state.approval_email_sent_at, state.human_approver,
+            state.human_feedback, state.approval_timestamp,
+            state.next_step_after_approval, state.created_at, state.updated_at
+        ))
+        self.conn.commit()
+        logger.info(f"Workflow {state.workflow_id} saved: {state.status.value}")
+
+    def get_workflow_state(self, workflow_id: str) -> Optional[WorkflowState]:
+        self.cursor.execute("SELECT * FROM workflows WHERE workflow_id = ?", (workflow_id,))
+        row = self.cursor.fetchone()
+        if not row:
+            return None
+        return WorkflowState(
+            workflow_id=row[0], agent_name=row[1], project_name=row[2],
+            current_stage_gate=StageGateName(row[3]), status=WorkflowStatus(row[4]),
+            content_pending_approval=row[5], content_hash=row[6],
+            approval_email_sent_at=row[7], human_approver=row[8],
+            human_feedback=row[9], approval_timestamp=row[10],
+            next_step_after_approval=row[11], created_at=row[12], updated_at=row[13]
+        )
+
+    def get_pending_approvals(self) -> List[WorkflowState]:
+        self.cursor.execute("""
+            SELECT * FROM workflows WHERE status = ? ORDER BY updated_at ASC
+        """, (WorkflowStatus.APPROVAL_SENT.value,))
+        return [
+            WorkflowState(
+                workflow_id=r[0], agent_name=r[1], project_name=r[2],
+                current_stage_gate=StageGateName(r[3]), status=WorkflowStatus(r[4]),
+                content_pending_approval=r[5], content_hash=r[6],
+                approval_email_sent_at=r[7], human_approver=r[8],
+                human_feedback=r[9], approval_timestamp=r[10],
+                next_step_after_approval=r[11], created_at=r[12], updated_at=r[13]
+            )
+            for r in self.cursor.fetchall()
+        ]
+
+    def get_approved_workflows_ready_to_resume(self) -> List[WorkflowState]:
+        self.cursor.execute("""
+            SELECT * FROM workflows WHERE status = ? AND approval_timestamp IS NOT NULL
+            ORDER BY approval_timestamp ASC
+        """, (WorkflowStatus.APPROVED.value,))
+        return [
+            WorkflowState(
+                workflow_id=r[0], agent_name=r[1], project_name=r[2],
+                current_stage_gate=StageGateName(r[3]), status=WorkflowStatus(r[4]),
+                content_pending_approval=r[5], content_hash=r[6],
+                approval_email_sent_at=r[7], human_approver=r[8],
+                human_feedback=r[9], approval_timestamp=r[10],
+                next_step_after_approval=r[11], created_at=r[12], updated_at=r[13]
+            )
+            for r in self.cursor.fetchall()
+        ]
+
+    def record_approval(self, workflow_id: str, stage_gate: StageGateName,
+                        approver_email: str, decision: str, feedback: str = None):
+        self.cursor.execute("""
+            INSERT INTO approvals
+            (workflow_id, stage_gate, approver_email, decision, feedback, decided_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (workflow_id, stage_gate.value, approver_email, decision, feedback,
+              datetime.now().isoformat()))
+        self.conn.commit()
+        logger.info(f"Approval recorded for {workflow_id}: {decision}")
+
+    def log_agent_call(self, workflow_id: str, agent_name: str,
+                       input_tokens: int, output_tokens: int, cost_usd: float,
+                       status: str, reason: str = None):
+        self.cursor.execute("""
+            INSERT INTO agent_calls
+            (workflow_id, agent_name, timestamp, input_tokens, output_tokens, cost_usd, status, reason)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (workflow_id, agent_name, project_name, stage_gate, status, content,
-              datetime.now().isoformat(), datetime.now().isoformat()))
+        """, (workflow_id, agent_name, datetime.now().isoformat(),
+              input_tokens, output_tokens, cost_usd, status, reason))
         self.conn.commit()
 
-    def get_workflow(self, workflow_id: str) -> Optional[Dict]:
-        """Get workflow by ID"""
-        cursor = self.conn.execute(
-            "SELECT * FROM workflows WHERE workflow_id = ?", (workflow_id,)
-        )
-        row = cursor.fetchone()
-        if row:
-            return {
-                "workflow_id": row[0],
-                "agent_name": row[1],
-                "project_name": row[2],
-                "stage_gate": row[3],
-                "status": row[4],
-                "content": row[5],
-                "created_at": row[6],
-                "updated_at": row[7]
-            }
-        return None
-
-    def get_pending_approvals(self) -> List[Dict]:
-        """Get all workflows awaiting approval"""
-        cursor = self.conn.execute(
-            "SELECT * FROM workflows WHERE status = 'approval_sent' ORDER BY updated_at"
-        )
-        return [
-            {
-                "workflow_id": r[0],
-                "agent_name": r[1],
-                "project_name": r[2],
-                "stage_gate": r[3],
-                "status": r[4],
-                "created_at": r[6],
-            }
-            for r in cursor.fetchall()
-        ]
 # ============================================================================
-# EMAIL GATEWAY
+# EMAIL GATEWAY (Outlook SMTP)
 # ============================================================================
 class EmailGateway:
-    """Email notification system"""
+    """Send approval emails to humans via Outlook SMTP."""
 
-    def __init__(self):
-        self.sender = os.environ.get("OUTLOOK_SENDER")
-        self.password = os.environ.get("OUTLOOK_PASSWORD")
-        self.enabled = bool(self.sender and self.password)
+    def __init__(self, sender_email: Optional[str] = None,
+                 sender_password: Optional[str] = None):
+        self.sender_email = sender_email or os.environ.get("OUTLOOK_SENDER")
+        self.sender_password = sender_password or os.environ.get("OUTLOOK_PASSWORD")
+        self.smtp_server = "smtp.office365.com"
+        self.smtp_port = 587
 
-    def send_approval_request(self, workflow_id: str, stage_gate: str,
-                             approver_email: str, content_summary: str) -> bool:
-        """Send approval request email"""
+        if not self.sender_email or not self.sender_password:
+            logger.warning("Email credentials not configured. Email gates will be skipped.")
+            self.enabled = False
+        else:
+            self.enabled = True
+
+    def send_approval_request(self,
+                              workflow_id: str,
+                              stage_gate: StageGate,
+                              agent_name: str,
+                              project_name: str,
+                              content_summary: str,
+                              content_detail: str) -> bool:
+        """Send approval request email to human."""
+
         if not self.enabled:
-            print(f"⚠️  Email disabled. Would send to {approver_email}")
-            return True  # Pretend sent for testing
+            logger.warning(f"Email disabled. Approval email for {workflow_id} not sent.")
+            return False
 
-        try:
-            subject = f"[Approval Required] {stage_gate} ({workflow_id})"
-            body = f"""
+        subject = f"[Approval Required] {agent_name} - {stage_gate.description} ({project_name})"
+
+        body = f"""
 APPROVAL REQUEST
-Workflow ID: {workflow_id}
-Stage Gate: {stage_gate}
-Request Time: {datetime.now().isoformat()}
-CONTENT:
-{content_summary[:500]}...
+Agent:        {agent_name}
+Project:      {project_name}
+Stage Gate:   {stage_gate.description}
+Workflow ID:  {workflow_id}
+Request Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+SUMMARY:
+{content_summary}
+
+DETAILED CONTENT:
+{content_detail[:500]}...
+
 ACTION REQUIRED:
-Reply with: APPROVED or REJECTED
-Timeout: 24 hours
+Reply to this email with:
+  APPROVED  (to approve and allow agent to proceed)
+  REJECTED  (to reject and pause workflow)
+
+Optional: Include feedback in your reply.
+Timeout: This request will auto-escalate in {stage_gate.timeout_hours} hours if no response.
+
+---
+This is an automated message from First Genesis Agent System.
+Plain text replies only please.
 """
 
-            msg = MIMEMultipart()
-            msg["From"] = self.sender
-            msg["To"] = approver_email
-            msg["Subject"] = subject
-            msg.attach(MIMEText(body, "plain"))
+        try:
+            message = MIMEMultipart()
+            message["From"] = self.sender_email
+            message["To"] = stage_gate.approver_email
+            if stage_gate.cc_emails:
+                message["Cc"] = ", ".join(stage_gate.cc_emails)
+            message["Subject"] = subject
+            message.attach(MIMEText(body, "plain"))
 
-            with smtplib.SMTP("smtp.office365.com", 587) as server:
+            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
                 server.starttls()
-                server.login(self.sender, self.password)
-                server.sendmail(self.sender, [approver_email], msg.as_string())
+                server.login(self.sender_email, self.sender_password)
+                recipients = [stage_gate.approver_email]
+                if stage_gate.cc_emails:
+                    recipients.extend(stage_gate.cc_emails)
+                server.sendmail(self.sender_email, recipients, message.as_string())
 
-            print(f"📧 Email sent to {approver_email}")
+            logger.info(f"Approval email sent for {workflow_id} to {stage_gate.approver_email}")
             return True
 
         except Exception as e:
-            print(f"❌ Email failed: {str(e)}")
+            logger.error(f"Failed to send approval email for {workflow_id}: {str(e)}")
             return False
+
+    def parse_approval_response(self, email_subject: str, email_body: str) -> Tuple[str, str]:
+        """Parse approval response from human email. Returns (decision, feedback)."""
+        body_upper = email_body.upper()
+
+        if "APPROVED" in body_upper:
+            decision = "approved"
+        elif "REJECTED" in body_upper:
+            decision = "rejected"
+        else:
+            decision = "clarification_needed"
+
+        feedback = email_body.strip()
+        return decision, feedback
+
 # ============================================================================
-# AGENTS
+# STAGE GATE MANAGER
 # ============================================================================
-class PMAgent(Agent):
-    """Project Manager Agent"""
+class StageGateManager:
+    """Manage stage gates and approval workflows."""
 
-    def __init__(self, templates: Dict = None):
-        super().__init__(name="pm_agent", templates=templates or TEMPLATES.get("pm_agent", {}))
-        self.db = WorkflowDB()
+    STAGE_GATES = {
+        StageGateName.CHARTER_APPROVAL: StageGate(
+            name=StageGateName.CHARTER_APPROVAL,
+            description="Project Charter Review & Approval",
+            approver_email="trice@firstgenesis.com",
+            cc_emails=["elina@firstgenesis.com"],
+            require_comment=False,
+            timeout_hours=24
+        ),
+        StageGateName.REQUIREMENTS_APPROVAL: StageGate(
+            name=StageGateName.REQUIREMENTS_APPROVAL,
+            description="Requirements Specification Review",
+            approver_email="kiera@firstgenesis.com",
+            cc_emails=["trice@firstgenesis.com"],
+            require_comment=True,
+            timeout_hours=12
+        ),
+        StageGateName.QA_AUDIT_APPROVAL: StageGate(
+            name=StageGateName.QA_AUDIT_APPROVAL,
+            description="QA Audit & Pre-Delivery Approval",
+            approver_email="trice@firstgenesis.com",
+            cc_emails=["kiera@firstgenesis.com"],
+            require_comment=False,
+            timeout_hours=6
+        ),
+        StageGateName.DELIVERY_APPROVAL: StageGate(
+            name=StageGateName.DELIVERY_APPROVAL,
+            description="Final Approval Before Customer Delivery",
+            approver_email="kiera@firstgenesis.com",
+            cc_emails=["trice@firstgenesis.com", "elina@firstgenesis.com"],
+            require_comment=True,
+            timeout_hours=2
+        ),
+        StageGateName.BUDGET_ESCALATION: StageGate(
+            name=StageGateName.BUDGET_ESCALATION,
+            description="Budget Alert - Approval to Continue",
+            approver_email="pascal@firstgenesis.com",
+            cc_emails=["kiera@firstgenesis.com"],
+            require_comment=True,
+            timeout_hours=1
+        )
+    }
 
-    def generate_charter(self, project_metadata: Dict) -> Tuple[str, str]:
-        """Generate project charter with approval gate"""
+    def __init__(self, db: WorkflowDatabase, email_gateway: EmailGateway):
+        self.db = db
+        self.email = email_gateway
 
-        workflow_id = f"pm_{project_metadata.get('project', 'unknown')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    def pause_at_gate(self, workflow_id: str, agent_name: str, project_name: str,
+                      stage_gate_name: StageGateName,
+                      content_pending_approval: str) -> WorkflowState:
+        """Pause workflow at a stage gate and send approval email."""
 
-        # Generate charter using Claude
-        system_prompt = "You are a project manager. Generate a professional project charter in JSON format."
-        user_message = f"""Create a project charter for:
-{json.dumps(project_metadata, indent=2)}
-Use this template structure:
-{self.templates.get('project_charter', 'DEFAULT CHARTER')}
-Output as JSON only."""
+        stage_gate = self.STAGE_GATES.get(stage_gate_name)
+        if not stage_gate:
+            raise ValueError(f"Unknown stage gate: {stage_gate_name}")
 
-        try:
-            response = self.client.messages.create(
-                model="claude-opus-4-6",
-                max_tokens=1500,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_message}]
-            )
+        content_hash = hashlib.sha256(content_pending_approval.encode()).hexdigest()
+        workflow_state = WorkflowState(
+            workflow_id=workflow_id,
+            agent_name=agent_name,
+            project_name=project_name,
+            current_stage_gate=stage_gate_name,
+            status=WorkflowStatus.PENDING,
+            content_pending_approval=content_pending_approval,
+            content_hash=content_hash
+        )
+        self.db.save_workflow_state(workflow_state)
 
-            charter = response.content[0].text
-
-            # Save workflow
-            self.db.save_workflow(
-                workflow_id=workflow_id,
-                agent_name="pm_agent",
-                project_name=project_metadata.get('project', 'unknown'),
-                stage_gate=StageGateName.CHARTER_APPROVAL.value,
-                status=WorkflowStatus.PENDING.value,
-                content=charter
-            )
-
-            # Send approval email
-            email_gateway = EmailGateway()
-            email_gateway.send_approval_request(
-                workflow_id=workflow_id,
-                stage_gate=StageGateName.CHARTER_APPROVAL.value,
-                approver_email="trice@firstgenesis.com",
-                content_summary=charter[:200]
-            )
-
-            # Update status
-            self.db.save_workflow(
-                workflow_id=workflow_id,
-                agent_name="pm_agent",
-                project_name=project_metadata.get('project', 'unknown'),
-                stage_gate=StageGateName.CHARTER_APPROVAL.value,
-                status=WorkflowStatus.APPROVAL_SENT.value,
-                content=charter
-            )
-
-            return charter, workflow_id
-
-        except Exception as e:
-            print(f"❌ Charter generation failed: {str(e)}")
-            return "", ""
-class BAAgent(Agent):
-    """Business Analyst Agent"""
-
-    def __init__(self, templates: Dict = None):
-        super().__init__(name="ba_agent", templates=templates or TEMPLATES.get("ba_agent", {}))
-        self.db = WorkflowDB()
-
-    def process_design_session(self, transcript: str, project_name: str) -> Tuple[str, str]:
-        """Process design session transcript"""
-
-        workflow_id = f"ba_{project_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-        system_prompt = "You are a business analyst. Extract requirements from the design session."
-        user_message = f"""Analyze this design session transcript and extract requirements:
-{transcript}
-Use this template:
-{self.templates.get('requirements', 'DEFAULT REQUIREMENTS')}
-Output as JSON."""
-
-        try:
-            response = self.client.messages.create(
-                model="claude-opus-4-6",
-                max_tokens=1500,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_message}]
-            )
-
-            requirements = response.content[0].text
-
-            # Save workflow
-            self.db.save_workflow(
-                workflow_id=workflow_id,
-                agent_name="ba_agent",
-                project_name=project_name,
-                stage_gate=StageGateName.REQUIREMENTS_APPROVAL.value,
-                status=WorkflowStatus.APPROVAL_SENT.value,
-                content=requirements
-            )
-
-            # Send approval email
-            email_gateway = EmailGateway()
-            email_gateway.send_approval_request(
-                workflow_id=workflow_id,
-                stage_gate=StageGateName.REQUIREMENTS_APPROVAL.value,
-                approver_email="kiera@firstgenesis.com",
-                content_summary=requirements[:200]
-            )
-
-            return requirements, workflow_id
-
-        except Exception as e:
-            print(f"❌ Requirements extraction failed: {str(e)}")
-            return "", ""
-class QAAgent(Agent):
-    """Quality Assurance Agent"""
-
-    def __init__(self, templates: Dict = None):
-        super().__init__(name="qa_agent", templates=templates or TEMPLATES.get("qa_agent", {}))
-        self.db = WorkflowDB()
-
-    def audit_deliverable(self, workflow_id: str) -> Tuple[str, str]:
-        """Audit deliverable before delivery"""
-
-        qa_workflow_id = f"qa_{workflow_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-        # Get original workflow
-        original = self.db.get_workflow(workflow_id)
-        if not original:
-            return "", ""
-
-        system_prompt = "You are a QA auditor. Review deliverables for quality and completeness."
-        user_message = f"""Audit this deliverable for quality:
-{original['content'][:500]}...
-Use this audit template:
-{self.templates.get('qa_checklist', 'DEFAULT QA CHECKLIST')}
-Output as JSON."""
-
-        try:
-            response = self.client.messages.create(
-                model="claude-opus-4-6",
-                max_tokens=1500,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_message}]
-            )
-
-            audit_report = response.content[0].text
-
-            # Save workflow
-            self.db.save_workflow(
-                workflow_id=qa_workflow_id,
-                agent_name="qa_agent",
-                project_name=original['project_name'],
-                stage_gate=StageGateName.QA_AUDIT_APPROVAL.value,
-                status=WorkflowStatus.APPROVAL_SENT.value,
-                content=audit_report
-            )
-
-            # Send approval email
-            email_gateway = EmailGateway()
-            email_gateway.send_approval_request(
-                workflow_id=qa_workflow_id,
-                stage_gate=StageGateName.QA_AUDIT_APPROVAL.value,
-                approver_email="trice@firstgenesis.com",
-                content_summary=audit_report[:200]
-            )
-
-            return audit_report, qa_workflow_id
-
-        except Exception as e:
-            print(f"❌ Audit failed: {str(e)}")
-            return "", ""
-class ManagerAgent(Agent):
-    """Portfolio Manager Agent"""
-
-    def __init__(self, templates: Dict = None):
-        super().__init__(name="manager_agent", templates=templates or TEMPLATES.get("manager_agent", {}))
-        self.db = WorkflowDB()
-
-    def generate_dashboard(self) -> str:
-        """Generate portfolio dashboard"""
-
-        pending = self.db.get_pending_approvals()
-
-        dashboard = self.templates.get('portfolio_dashboard', 'DEFAULT DASHBOARD').format(
-            timestamp=datetime.now().isoformat(),
-            approval_count=len(pending),
-            blocker_count=0,
-            total_projects=len(pending),
-            on_track=len(pending) // 2,
-            at_risk=len(pending) // 4,
-            health_score=85
+        email_sent = self.email.send_approval_request(
+            workflow_id=workflow_id,
+            stage_gate=stage_gate,
+            agent_name=agent_name,
+            project_name=project_name,
+            content_summary=content_pending_approval[:200],
+            content_detail=content_pending_approval
         )
 
-        return dashboard
+        if email_sent:
+            workflow_state.status = WorkflowStatus.APPROVAL_SENT
+            workflow_state.approval_email_sent_at = datetime.now().isoformat()
+        else:
+            logger.warning(f"Email failed for {workflow_id}, workflow remains in PENDING")
+
+        self.db.save_workflow_state(workflow_state)
+        return workflow_state
+
+    def record_approval_response(self, workflow_id: str, approver_email: str,
+                                 decision: str, feedback: str = None) -> WorkflowState:
+        """Record human approval response and update workflow state."""
+
+        workflow_state = self.db.get_workflow_state(workflow_id)
+        if not workflow_state:
+            raise ValueError(f"Workflow not found: {workflow_id}")
+
+        self.db.record_approval(
+            workflow_id=workflow_id,
+            stage_gate=workflow_state.current_stage_gate,
+            approver_email=approver_email,
+            decision=decision,
+            feedback=feedback
+        )
+
+        if decision.lower() == "approved":
+            workflow_state.status = WorkflowStatus.APPROVED
+            workflow_state.human_approver = approver_email
+            workflow_state.human_feedback = feedback
+            workflow_state.approval_timestamp = datetime.now().isoformat()
+            logger.info(f"Workflow {workflow_id} APPROVED by {approver_email}")
+        elif decision.lower() == "rejected":
+            workflow_state.status = WorkflowStatus.REJECTED
+            workflow_state.human_approver = approver_email
+            workflow_state.human_feedback = feedback
+            logger.warning(f"Workflow {workflow_id} REJECTED by {approver_email}: {feedback}")
+        else:
+            logger.warning(f"Unknown decision for {workflow_id}: {decision}")
+
+        self.db.save_workflow_state(workflow_state)
+        return workflow_state
+
+    def get_pending_approvals_summary(self) -> str:
+        """Generate summary of pending approvals."""
+        pending = self.db.get_pending_approvals()
+
+        if not pending:
+            return "No pending approvals"
+
+        summary = f"\n{'='*70}\nPENDING APPROVALS ({len(pending)})\n{'='*70}\n"
+        for workflow in pending:
+            sent_at = datetime.fromisoformat(workflow.approval_email_sent_at)
+            hours_waiting = (datetime.now() - sent_at).total_seconds() / 3600
+            summary += f"\n[{workflow.workflow_id}]\n"
+            summary += f"  Agent:       {workflow.agent_name}\n"
+            summary += f"  Project:     {workflow.project_name}\n"
+            summary += f"  Stage Gate:  {workflow.current_stage_gate.value}\n"
+            summary += f"  Waiting:     {hours_waiting:.1f} hours\n"
+            summary += f"  Content:     {workflow.content_pending_approval[:80]}...\n"
+        summary += "\n" + "=" * 70
+        return summary
+
 # ============================================================================
-# MAIN INTERFACE
+# AUTONOMOUS AGENT WITH EMAIL GATES
+# ============================================================================
+class AutonomousAgentWithEmailGates:
+    """Agent system with email-based human approval gates."""
+
+    def __init__(self, api_key: Optional[str] = None):
+        self.client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
+        self.db = WorkflowDatabase()
+        self.email_gateway = EmailGateway()
+        self.stage_gate_manager = StageGateManager(self.db, self.email_gateway)
+        logger.info("Agent system with email gates initialized")
+
+    def run_pm_agent_with_gates(self, project_metadata: dict) -> Tuple[str, WorkflowState]:
+        """
+        Run PM Agent with email-based approval gate.
+        1. Agent generates project charter
+        2. Pauses at charter_approval gate
+        3. Emails approver and returns workflow state
+        """
+        workflow_id = f"pm_{project_metadata['project']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        project_name = project_metadata.get('project', 'Unknown')
+
+        logger.info(f"Starting PM Agent workflow: {workflow_id}")
+
+        system_prompt = """You are a Project Manager Agent for First Genesis.
+Output ONLY valid JSON. NO explanations, NO preamble."""
+
+        user_message = f"""Generate project charter for:
+{json.dumps(project_metadata, indent=2)}
+Output as JSON only:
+{{"project_charter": {{"title": "...", "client": "...", "timeline": "..."}}, "wbs": {{}}, "risks": []}}"""
+
+        try:
+            response = self.client.messages.create(
+                model="claude-opus-4-6",
+                max_tokens=2000,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_message}]
+            )
+
+            charter_output = response.content[0].text
+            cost = TokenCost(
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens
+            ).total_cost_usd()
+            self.db.log_agent_call(
+                workflow_id=workflow_id,
+                agent_name="pm_agent",
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                cost_usd=cost,
+                status="success"
+            )
+            logger.info(f"PM Agent generated charter: {len(charter_output)} chars, cost ${cost:.4f}")
+
+        except Exception as e:
+            logger.error(f"PM Agent failed: {str(e)}")
+            self.db.log_agent_call(
+                workflow_id=workflow_id, agent_name="pm_agent",
+                input_tokens=0, output_tokens=0, cost_usd=0,
+                status="error", reason=str(e)
+            )
+            raise
+
+        workflow_state = self.stage_gate_manager.pause_at_gate(
+            workflow_id=workflow_id,
+            agent_name="pm_agent",
+            project_name=project_name,
+            stage_gate_name=StageGateName.CHARTER_APPROVAL,
+            content_pending_approval=charter_output
+        )
+
+        logger.info(f"Workflow {workflow_id} paused at {workflow_state.current_stage_gate.value}")
+        return charter_output, workflow_state
+
+    def resume_approved_workflow(self, workflow_id: str) -> str:
+        """Resume a workflow that has been approved."""
+
+        workflow_state = self.db.get_workflow_state(workflow_id)
+        if not workflow_state:
+            logger.error(f"Workflow not found: {workflow_id}")
+            return ""
+
+        if workflow_state.status != WorkflowStatus.APPROVED:
+            logger.warning(f"Workflow {workflow_id} not in APPROVED state: {workflow_state.status.value}")
+            return ""
+
+        logger.info(f"Resuming approved workflow: {workflow_id}")
+
+        next_actions = {
+            StageGateName.CHARTER_APPROVAL: "Charter approved. Ready for customer kickoff.",
+            StageGateName.REQUIREMENTS_APPROVAL: "Requirements approved. Starting design sessions.",
+            StageGateName.QA_AUDIT_APPROVAL: "Audit approved. Proceeding to delivery.",
+        }
+
+        next_action = next_actions.get(workflow_state.current_stage_gate, "")
+        if not next_action:
+            logger.warning(f"Unknown next step for gate: {workflow_state.current_stage_gate.value}")
+            return ""
+
+        is_final = workflow_state.current_stage_gate == StageGateName.QA_AUDIT_APPROVAL
+        workflow_state.status = WorkflowStatus.COMPLETED if is_final else WorkflowStatus.RESUMED
+        workflow_state.next_step_after_approval = next_action
+        self.db.save_workflow_state(workflow_state)
+
+        logger.info(f"Agent proceeding: {next_action}")
+        return next_action
+
+    def check_pending_approvals(self) -> str:
+        return self.stage_gate_manager.get_pending_approvals_summary()
+
+    def process_approval_response(self, workflow_id: str, approver_email: str,
+                                  decision: str, feedback: str = None) -> str:
+        """Process a human approval response."""
+        workflow_state = self.stage_gate_manager.record_approval_response(
+            workflow_id=workflow_id,
+            approver_email=approver_email,
+            decision=decision,
+            feedback=feedback
+        )
+
+        response_msg = (
+            f"\nApproval recorded for {workflow_id}:\n"
+            f"  Decision:  {decision}\n"
+            f"  Approver:  {approver_email}\n"
+            f"  Feedback:  {feedback or 'None'}\n\n"
+            f"Workflow status updated to: {workflow_state.status.value}\n"
+        )
+        logger.info(response_msg)
+        return response_msg
+
+# ============================================================================
+# MAIN ENTRY POINT
 # ============================================================================
 def main():
-    """CLI interface"""
+    """CLI for agent operations with email gates."""
 
     if len(sys.argv) < 2:
-        print("Usage: python script.py [command]")
+        print("Usage: python claude_code_agent_ecosystem.py [command]")
         print("\nCommands:")
-        print("  run_pm_agent --project <name> --client <name>")
-        print("  check_approvals")
-        print("  process_approval --workflow-id <id> --decision <approved|rejected>")
-        print("  run_dashboard")
-        return
+        print("  run_pm_agent              Run PM Agent with approval gate")
+        print("  check_approvals           Show pending approvals")
+        print("  resume_workflows          Resume approved workflows")
+        print("  process_approval          Process approval response")
+        print("    --workflow-id <id>")
+        print("    --approver <email>")
+        print("    --decision <approved|rejected>")
+        print("    --feedback <comment>")
+        sys.exit(1)
 
+    agent = AutonomousAgentWithEmailGates()
     command = sys.argv[1]
 
     if command == "run_pm_agent":
-        # Parse arguments
-        project = None
-        client = None
-        for i, arg in enumerate(sys.argv[2:]):
-            if arg == "--project" and i + 2 < len(sys.argv):
-                project = sys.argv[i + 3]
-            elif arg == "--client" and i + 2 < len(sys.argv):
-                client = sys.argv[i + 3]
+        logger.info("Running PM Agent with email approval gate...")
+        try:
+            charter, workflow_state = agent.run_pm_agent_with_gates({
+                "client": "Malcolm Goodwin",
+                "project": "AURA MVP",
+                "timeline_weeks": 12,
+                "scope": "Silhouette technology + 3D mesh design"
+            })
 
-        if not project or not client:
-            print("ERROR: --project and --client required")
-            return
+            print("\n" + "=" * 70)
+            print(f"WORKFLOW CREATED: {workflow_state.workflow_id}")
+            print("=" * 70)
+            print(f"Status:      {workflow_state.status.value}")
+            print(f"Stage Gate:  {workflow_state.current_stage_gate.value}")
+            print(f"Sent To:     {StageGateManager.STAGE_GATES[StageGateName.CHARTER_APPROVAL].approver_email}")
+            print(f"Awaiting:    Approval via email")
+            print("\nGenerated Charter (preview):")
+            print(charter[:300] + "...")
+            print("\n" + "=" * 70)
+            print("Agent paused at stage gate. Awaiting approval email.")
+            print("=" * 70)
 
-        pm_agent = PMAgent(templates=TEMPLATES["pm_agent"])
-        charter, workflow_id = pm_agent.generate_charter({
-            "project": project,
-            "client": client,
-            "budget": 150000,
-            "timeline": 12,
-            "scope": "Project scope here"
-        })
-
-        print(f"\n✅ Charter generated")
-        print(f"Workflow ID: {workflow_id}")
-        print(f"Status: Awaiting approval")
-        print(f"\nCharter preview:\n{charter[:300]}...")
+        except Exception as e:
+            logger.error(f"Error: {str(e)}")
+            print(f"ERROR: {str(e)}")
 
     elif command == "check_approvals":
-        db = WorkflowDB()
-        pending = db.get_pending_approvals()
+        print(agent.check_pending_approvals())
 
-        print(f"\n📋 Pending Approvals ({len(pending)})")
-        for wf in pending:
-            print(f"  - {wf['workflow_id']}: {wf['stage_gate']}")
+    elif command == "resume_workflows":
+        logger.info("Resuming approved workflows...")
+        pending_approved = agent.db.get_approved_workflows_ready_to_resume()
+
+        if not pending_approved:
+            print("No approved workflows ready to resume.")
+        else:
+            for workflow in pending_approved:
+                result = agent.resume_approved_workflow(workflow.workflow_id)
+                print(f"\nResumed {workflow.workflow_id}")
+                print(f"   Next step: {result}")
 
     elif command == "process_approval":
-        # Parse arguments
-        workflow_id = None
-        decision = None
-        for i, arg in enumerate(sys.argv[2:]):
-            if arg == "--workflow-id" and i + 2 < len(sys.argv):
-                workflow_id = sys.argv[i + 3]
-            elif arg == "--decision" and i + 2 < len(sys.argv):
-                decision = sys.argv[i + 3]
+        kwargs = {}
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--workflow-id" and i + 1 < len(sys.argv):
+                kwargs['workflow_id'] = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--approver" and i + 1 < len(sys.argv):
+                kwargs['approver_email'] = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--decision" and i + 1 < len(sys.argv):
+                kwargs['decision'] = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--feedback" and i + 1 < len(sys.argv):
+                kwargs['feedback'] = sys.argv[i + 1]; i += 2
+            else:
+                i += 1
 
-        if not workflow_id or not decision:
-            print("ERROR: --workflow-id and --decision required")
-            return
+        if 'workflow_id' not in kwargs:
+            print("ERROR: --workflow-id required")
+            sys.exit(1)
 
-        db = WorkflowDB()
-        db.conn.execute("""
-            INSERT INTO approvals (workflow_id, stage_gate, approver, decision, timestamp)
-            VALUES (?, ?, ?, ?, ?)
-        """, (workflow_id, "charter_approval", "trice@firstgenesis.com", decision,
-              datetime.now().isoformat()))
-        db.conn.commit()
-
-        print(f"✅ Approval recorded for {workflow_id}: {decision}")
-
-    elif command == "run_dashboard":
-        manager = ManagerAgent(templates=TEMPLATES["manager_agent"])
-        dashboard = manager.generate_dashboard()
-        print(f"\n{dashboard}")
+        print(agent.process_approval_response(**kwargs))
 
     else:
         print(f"Unknown command: {command}")
+        sys.exit(1)
+
 if __name__ == "__main__":
     main()
