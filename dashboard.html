@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>First Genesis — Agent Command Center</title>
+  <style>
+    /* ── Reset & Base ──────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      display: grid;
+      grid-template-rows: 56px 1fr;
+      grid-template-columns: 200px 1fr 280px;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Top bar ───────────────────────────────────────────────────────────── */
+    header {
+      grid-column: 1 / -1;
+      background: #1a1d2e;
+      border-bottom: 1px solid #2d3148;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+    }
+    header .brand { font-size: 1rem; font-weight: 700; color: #7c6af7; letter-spacing: .5px; }
+    header .brand span { color: #a78bfa; }
+    header .meta { font-size: .75rem; color: #64748b; display: flex; gap: 20px; align-items: center; }
+    header .live-dot {
+      width: 8px; height: 8px; border-radius: 50%; background: #22c55e;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+    /* ── Left Nav ──────────────────────────────────────────────────────────── */
+    nav {
+      background: #13151f;
+      border-right: 1px solid #2d3148;
+      padding: 16px 0;
+      overflow-y: auto;
+    }
+    nav .nav-section { font-size: .65rem; color: #475569; padding: 12px 16px 4px; text-transform: uppercase; letter-spacing: 1px; }
+    nav a {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 16px; font-size: .82rem; color: #94a3b8;
+      cursor: pointer; border-left: 3px solid transparent;
+      text-decoration: none; transition: all .15s;
+    }
+    nav a:hover { background: #1e2130; color: #e2e8f0; }
+    nav a.active { background: #1e2130; color: #a78bfa; border-left-color: #7c6af7; }
+    nav a .icon { font-size: 1rem; width: 20px; text-align: center; }
+
+    /* ── Main content ──────────────────────────────────────────────────────── */
+    main {
+      overflow-y: auto;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    /* ── Section headers ───────────────────────────────────────────────────── */
+    .section-title {
+      font-size: .9rem; font-weight: 600; color: #cbd5e1;
+      margin-bottom: 12px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .section-title small { font-size: .7rem; color: #64748b; font-weight: 400; }
+
+    /* ── KPI Strip ─────────────────────────────────────────────────────────── */
+    .kpi-strip {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+    }
+    .kpi {
+      background: #1a1d2e;
+      border: 1px solid #2d3148;
+      border-radius: 10px;
+      padding: 16px 18px;
+    }
+    .kpi .label { font-size: .7rem; color: #64748b; margin-bottom: 4px; }
+    .kpi .value { font-size: 1.7rem; font-weight: 700; }
+    .kpi .sub { font-size: .72rem; color: #94a3b8; margin-top: 2px; }
+    .kpi.green .value { color: #22c55e; }
+    .kpi.blue  .value { color: #60a5fa; }
+    .kpi.purple .value { color: #a78bfa; }
+    .kpi.amber .value { color: #fbbf24; }
+
+    /* ── Agent grid ────────────────────────────────────────────────────────── */
+    .agent-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 12px;
+    }
+    .agent-card {
+      background: #1a1d2e;
+      border: 1px solid #2d3148;
+      border-radius: 10px;
+      padding: 16px;
+      transition: border-color .2s;
+    }
+    .agent-card:hover { border-color: #4f46e5; }
+    .agent-card .agent-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .agent-card .agent-name { font-size: .85rem; font-weight: 600; }
+    .agent-card .agent-role { font-size: .7rem; color: #64748b; margin-bottom: 8px; }
+    .badge {
+      font-size: .62rem; font-weight: 600; padding: 2px 7px; border-radius: 20px;
+      text-transform: uppercase; letter-spacing: .5px;
+    }
+    .badge.idle       { background: #1e293b; color: #64748b; }
+    .badge.thinking   { background: #1e3a5f; color: #60a5fa; }
+    .badge.executing  { background: #1a3d2f; color: #22c55e; }
+    .badge.waiting    { background: #3d2c1a; color: #fbbf24; }
+    .badge.waiting_approval { background: #3d2c1a; color: #fbbf24; }
+    .badge.error      { background: #3d1a1a; color: #f87171; }
+    .badge.complete   { background: #1a2f1e; color: #86efac; }
+    .stat-row { display: flex; justify-content: space-between; font-size: .72rem; color: #94a3b8; margin-top: 6px; }
+    .skill-bar-wrap { margin-top: 8px; }
+    .skill-bar-label { display: flex; justify-content: space-between; font-size: .68rem; color: #64748b; }
+    .skill-bar { height: 4px; background: #2d3148; border-radius: 2px; margin-top: 3px; overflow: hidden; }
+    .skill-bar-fill { height: 100%; background: linear-gradient(90deg, #7c6af7, #a78bfa); border-radius: 2px; transition: width .4s; }
+    .current-task { font-size: .7rem; color: #a78bfa; margin-top: 6px; min-height: 16px; font-style: italic; }
+
+    /* ── Communication log ─────────────────────────────────────────────────── */
+    .comm-log {
+      background: #1a1d2e;
+      border: 1px solid #2d3148;
+      border-radius: 10px;
+      padding: 16px;
+      max-height: 320px;
+      overflow-y: auto;
+    }
+    .comm-entry {
+      display: flex; gap: 10px; padding: 8px 0;
+      border-bottom: 1px solid #1e2130; font-size: .78rem;
+    }
+    .comm-entry:last-child { border-bottom: none; }
+    .comm-entry .time { color: #475569; min-width: 60px; font-size: .68rem; }
+    .comm-entry .from { font-weight: 600; color: #a78bfa; min-width: 90px; }
+    .comm-entry .arrow { color: #475569; }
+    .comm-entry .to   { font-weight: 600; color: #60a5fa; min-width: 90px; }
+    .msg-type-badge {
+      font-size: .6rem; padding: 1px 6px; border-radius: 10px; font-weight: 600;
+      text-transform: uppercase;
+    }
+    .msg-type-badge.delegate  { background: #2d1a5f; color: #a78bfa; }
+    .msg-type-badge.provide_output { background: #1a2f1e; color: #86efac; }
+    .msg-type-badge.request_input  { background: #1e3a5f; color: #60a5fa; }
+    .msg-type-badge.feedback  { background: #3d2c1a; color: #fbbf24; }
+    .msg-type-badge.initiate  { background: #1a2f2f; color: #67e8f9; }
+    .msg-type-badge.escalate  { background: #3d1a1a; color: #f87171; }
+
+    /* ── Right sidebar ─────────────────────────────────────────────────────── */
+    aside {
+      background: #13151f;
+      border-left: 1px solid #2d3148;
+      overflow-y: auto;
+      padding: 16px;
+    }
+    .aside-tabs { display: flex; gap: 4px; margin-bottom: 14px; }
+    .aside-tab {
+      font-size: .72rem; padding: 5px 10px; border-radius: 6px; cursor: pointer;
+      color: #64748b; background: #1a1d2e; border: 1px solid transparent;
+      transition: all .15s;
+    }
+    .aside-tab.active { background: #2d3148; color: #a78bfa; border-color: #4f46e5; }
+    .aside-section { display: none; }
+    .aside-section.active { display: block; }
+
+    .pattern-card, .lesson-card, .skill-entry {
+      background: #1a1d2e;
+      border: 1px solid #2d3148;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 8px;
+      font-size: .75rem;
+    }
+    .pattern-card .seq { font-weight: 600; color: #a78bfa; margin-bottom: 5px; }
+    .pattern-card .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; color: #94a3b8; }
+    .pattern-card .meta-grid span { color: #e2e8f0; font-weight: 600; }
+    .lesson-card .title { font-weight: 600; color: #fbbf24; margin-bottom: 4px; }
+    .lesson-card .body  { color: #94a3b8; line-height: 1.5; margin-bottom: 4px; }
+    .lesson-card .agents { font-size: .68rem; color: #64748b; }
+    .skill-entry .sname { font-weight: 600; color: #60a5fa; margin-bottom: 3px; }
+    .skill-entry .slevel {
+      display: inline-block; font-size: .6rem; padding: 1px 6px; border-radius: 10px;
+      font-weight: 600; text-transform: uppercase; margin-left: 4px;
+    }
+    .slevel.NOVICE       { background: #1e293b; color: #64748b; }
+    .slevel.INTERMEDIATE { background: #1e3a5f; color: #60a5fa; }
+    .slevel.ADVANCED     { background: #1a3d2f; color: #22c55e; }
+    .slevel.EXPERT       { background: #2d1a5f; color: #a78bfa; }
+    .skill-entry .smeta  { color: #64748b; font-size: .68rem; margin-top: 2px; }
+
+    /* ── Skills breakdown panel ────────────────────────────────────────────── */
+    .skills-panel {
+      background: #1a1d2e;
+      border: 1px solid #2d3148;
+      border-radius: 10px;
+      padding: 16px;
+    }
+    .skills-agent-row { margin-bottom: 16px; }
+    .skills-agent-name { font-size: .82rem; font-weight: 600; color: #cbd5e1; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+    .skills-agent-name .rate { font-size: .7rem; font-weight: 400; color: #64748b; }
+    .skill-pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: #0f1117; border: 1px solid #2d3148;
+      border-radius: 6px; padding: 4px 10px; margin: 3px; font-size: .72rem;
+    }
+    .skill-pill .sc { color: #22c55e; font-weight: 700; }
+
+    /* ── View switching ────────────────────────────────────────────────────── */
+    .view { display: none; }
+    .view.active { display: contents; }
+    .view-block { display: none; flex-direction: column; gap: 20px; }
+    .view-block.active { display: flex; }
+
+    /* ── Utility ───────────────────────────────────────────────────────────── */
+    .empty { color: #475569; font-size: .78rem; padding: 12px 0; text-align: center; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #2d3148; border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<!-- ── Top bar ─────────────────────────────────────────────────────────────── -->
+<header>
+  <div class="brand">First Genesis &nbsp;<span>Agent Command Center</span></div>
+  <div class="meta">
+    <div class="live-dot"></div>
+    <span id="clock">--:--:--</span>
+    <span id="last-update">Waiting for data…</span>
+  </div>
+</header>
+
+<!-- ── Left Nav ────────────────────────────────────────────────────────────── -->
+<nav>
+  <div class="nav-section">Monitor</div>
+  <a class="active" onclick="showView('overview')"    data-view="overview">    <span class="icon">📊</span> Overview</a>
+  <a onclick="showView('comms')"       data-view="comms">       <span class="icon">💬</span> Communications</a>
+  <a onclick="showView('skills')"      data-view="skills">      <span class="icon">🧠</span> Skills</a>
+  <div class="nav-section">Library</div>
+  <a onclick="showView('patterns')"    data-view="patterns">    <span class="icon">🔄</span> Patterns</a>
+  <a onclick="showView('lessons')"     data-view="lessons">     <span class="icon">💡</span> Lessons</a>
+  <div class="nav-section">Finance</div>
+  <a onclick="showView('costs')"       data-view="costs">       <span class="icon">💰</span> Costs</a>
+</nav>
+
+<!-- ── Main content ────────────────────────────────────────────────────────── -->
+<main>
+
+  <!-- OVERVIEW ─────────────────────────────────────────────────── -->
+  <div class="view-block active" id="view-overview">
+    <div>
+      <div class="section-title">🎛️ System Status <small id="hdr-overview"></small></div>
+      <div class="kpi-strip">
+        <div class="kpi green">  <div class="label">Agents Online</div>    <div class="value" id="kpi-agents">5</div>    <div class="sub">All registered</div></div>
+        <div class="kpi blue">  <div class="label">Success Rate</div>     <div class="value" id="kpi-rate">—</div>      <div class="sub">All agents combined</div></div>
+        <div class="kpi purple"><div class="label">Total Skills</div>     <div class="value" id="kpi-skills">—</div>    <div class="sub">Across all agents</div></div>
+        <div class="kpi amber"> <div class="label">Workflow Patterns</div><div class="value" id="kpi-patterns">—</div>  <div class="sub">Reusable sequences</div></div>
+      </div>
+    </div>
+    <div>
+      <div class="section-title">🤖 Agent Monitor</div>
+      <div class="agent-grid" id="agent-grid"></div>
+    </div>
+    <div>
+      <div class="section-title">📡 Recent Communications <small>last 20 messages</small></div>
+      <div class="comm-log" id="comm-log-overview"></div>
+    </div>
+  </div>
+
+  <!-- COMMUNICATIONS ───────────────────────────────────────────── -->
+  <div class="view-block" id="view-comms">
+    <div>
+      <div class="section-title">💬 Full Communication Log</div>
+      <div class="comm-log" style="max-height:600px" id="comm-log-full"></div>
+    </div>
+  </div>
+
+  <!-- SKILLS ───────────────────────────────────────────────────── -->
+  <div class="view-block" id="view-skills">
+    <div>
+      <div class="section-title">🧠 Agent Skill Progression</div>
+      <div class="skills-panel" id="skills-panel"></div>
+    </div>
+  </div>
+
+  <!-- PATTERNS ─────────────────────────────────────────────────── -->
+  <div class="view-block" id="view-patterns">
+    <div>
+      <div class="section-title">🔄 Reusable Workflow Patterns</div>
+      <div id="patterns-list"></div>
+    </div>
+  </div>
+
+  <!-- LESSONS ──────────────────────────────────────────────────── -->
+  <div class="view-block" id="view-lessons">
+    <div>
+      <div class="section-title">💡 Lessons Learned</div>
+      <div id="lessons-list"></div>
+    </div>
+  </div>
+
+  <!-- COSTS ────────────────────────────────────────────────────── -->
+  <div class="view-block" id="view-costs">
+    <div>
+      <div class="section-title">💰 Cost Dashboard</div>
+      <div class="kpi-strip">
+        <div class="kpi green">  <div class="label">Daily Budget</div>   <div class="value">$5.00</div>  <div class="sub">Hard cap enforced</div></div>
+        <div class="kpi blue">  <div class="label">Agent Cost/Day</div>  <div class="value" id="cost-daily">—</div>    <div class="sub">claude-opus-4-6</div></div>
+        <div class="kpi purple"><div class="label">Monthly (est.)</div>  <div class="value" id="cost-monthly">—</div>  <div class="sub">Full portfolio</div></div>
+        <div class="kpi amber"> <div class="label">Budget Headroom</div> <div class="value" id="cost-headroom">—</div> <div class="sub">Budget ÷ agent cost</div></div>
+      </div>
+      <br/>
+      <div class="section-title">Per-Agent Breakdown</div>
+      <div id="cost-table" class="skills-panel"></div>
+    </div>
+  </div>
+
+</main>
+
+<!-- ── Right sidebar ───────────────────────────────────────────────────────── -->
+<aside>
+  <div class="aside-tabs">
+    <div class="aside-tab active" onclick="showAside('patterns')">Patterns</div>
+    <div class="aside-tab"        onclick="showAside('lessons')">Lessons</div>
+    <div class="aside-tab"        onclick="showAside('skills')">Skills</div>
+  </div>
+
+  <div class="aside-section active" id="aside-patterns">
+    <div class="section-title" style="font-size:.78rem">📚 Knowledge Library</div>
+    <div id="aside-patterns-list"><div class="empty">No patterns yet</div></div>
+  </div>
+
+  <div class="aside-section" id="aside-lessons">
+    <div class="section-title" style="font-size:.78rem">💡 Best Practices</div>
+    <div id="aside-lessons-list"><div class="empty">No lessons yet</div></div>
+  </div>
+
+  <div class="aside-section" id="aside-skills">
+    <div class="section-title" style="font-size:.78rem">🧠 All Skills</div>
+    <div id="aside-skills-list"><div class="empty">No skills recorded yet</div></div>
+  </div>
+</aside>
+
+<script>
+// ============================================================================
+// MOCK DATA — replace API_URL below with real backend when available
+// ============================================================================
+const API_URL = null;   // Set to "http://localhost:8000/api" to connect backend
+
+// Simulated initial state — mirrors demo_dashboard() output from Python
+let state = {
+  timestamp: new Date().toISOString(),
+  agents: [
+    { name:"PM Agent",     role:"Project Manager",   status:"executing",         current_task:"Drafting AURA charter",     skill_level:2.0, success_count:5,  error_count:0, active_workflows:1 },
+    { name:"BA Agent",     role:"Business Analyst",  status:"thinking",          current_task:"Extracting requirements",   skill_level:2.0, success_count:3,  error_count:0, active_workflows:1 },
+    { name:"QA Agent",     role:"Quality Assurance", status:"idle",              current_task:null,                        skill_level:1.0, success_count:2,  error_count:1, active_workflows:0 },
+    { name:"Vendor Agent", role:"Vendor Manager",    status:"idle",              current_task:null,                        skill_level:1.0, success_count:1,  error_count:0, active_workflows:0 },
+    { name:"Manager Agent",role:"Portfolio Manager", status:"waiting_approval",  current_task:"Awaiting charter approval", skill_level:2.0, success_count:4,  error_count:0, active_workflows:1 },
+  ],
+  recent_communications: [
+    { from:"PM Agent", to:"BA Agent",      type:"delegate",      timestamp: ts(-180) },
+    { from:"BA Agent", to:"PM Agent",      type:"provide_output",timestamp: ts(-120) },
+    { from:"PM Agent", to:"QA Agent",      type:"request_input", timestamp: ts(-60)  },
+    { from:"QA Agent", to:"PM Agent",      type:"feedback",      timestamp: ts(-30)  },
+    { from:"Manager Agent", to:"PM Agent", type:"feedback",      timestamp: ts(-10)  },
+  ],
+  workflow_patterns: [
+    { workflow_name:"PM Agent-BA Agent-QA Agent",      agent_sequence:["PM Agent","BA Agent","QA Agent"],      success_count:3, avg_duration_seconds:285, avg_cost_usd:0.08 },
+    { workflow_name:"PM Agent-BA Agent-Manager Agent", agent_sequence:["PM Agent","BA Agent","Manager Agent"], success_count:2, avg_duration_seconds:210, avg_cost_usd:0.06 },
+    { workflow_name:"PM Agent-Vendor Agent",            agent_sequence:["PM Agent","Vendor Agent"],             success_count:1, avg_duration_seconds:150, avg_cost_usd:0.04 },
+  ],
+  lessons_learned_count: 1,
+  total_skills: 5
+};
+
+let knowledgeData = {
+  lessons: [
+    { lesson_title:"Charter quality improves with design session review", lesson_content:"When BA Agent reviews design sessions first, PM Agent creates better charters with fewer revisions.", category:"process_optimization", applicable_agents:["PM Agent","BA Agent"] }
+  ],
+  skills: [
+    { agent_name:"PM Agent",      skill_name:"create_charter",        skill_level:"INTERMEDIATE", success_count:2, error_count:0, avg_execution_time:117.75 },
+    { agent_name:"BA Agent",      skill_name:"extract_requirements",   skill_level:"NOVICE",       success_count:1, error_count:0, avg_execution_time:180.0  },
+    { agent_name:"QA Agent",      skill_name:"audit_deliverable",      skill_level:"NOVICE",       success_count:1, error_count:0, avg_execution_time:90.0   },
+    { agent_name:"Manager Agent", skill_name:"portfolio_review",       skill_level:"NOVICE",       success_count:1, error_count:0, avg_execution_time:60.0   },
+    { agent_name:"Vendor Agent",  skill_name:"sla_management",         skill_level:"NOVICE",       success_count:1, error_count:0, avg_execution_time:75.0   },
+  ]
+};
+
+// Cost model (mirrors Python TokenBudgetModel / AgentCostModel)
+const AGENTS_COST = [
+  { name:"PM Agent",      calls:2, input:3500, output:1200 },
+  { name:"BA Agent",      calls:1, input:6000, output:1500 },
+  { name:"QA Agent",      calls:1, input:8000, output:2000 },
+  { name:"Vendor Agent",  calls:1, input:4000, output:800  },
+  { name:"Manager Agent", calls:1, input:5000, output:1500 },
+];
+const IN_RATE  = 5.00  / 1e6;
+const OUT_RATE = 25.00 / 1e6;
+
+function agentDailyCost(a) { return a.calls * (a.input * IN_RATE + a.output * OUT_RATE); }
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+function ts(offsetSec) {
+  const d = new Date(Date.now() + offsetSec * 1000);
+  return d.toISOString();
+}
+function fmtTime(iso) {
+  const d = new Date(iso);
+  return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+}
+function fmtSec(s) { return s >= 60 ? `${(s/60).toFixed(1)}m` : `${Math.round(s)}s`; }
+
+// ============================================================================
+// RENDER FUNCTIONS
+// ============================================================================
+function renderOverview() {
+  const agents = state.agents;
+
+  // KPIs
+  const totalSuccess = agents.reduce((s,a)=>s+a.success_count,0);
+  const totalError   = agents.reduce((s,a)=>s+a.error_count,0);
+  const rate = totalSuccess + totalError > 0
+    ? ((totalSuccess/(totalSuccess+totalError))*100).toFixed(0)+'%' : '—';
+  document.getElementById('kpi-agents').textContent   = agents.length;
+  document.getElementById('kpi-rate').textContent     = rate;
+  document.getElementById('kpi-skills').textContent   = state.total_skills;
+  document.getElementById('kpi-patterns').textContent = state.workflow_patterns.length;
+  document.getElementById('hdr-overview').textContent = '— ' + fmtTime(state.timestamp);
+
+  // Agent grid
+  document.getElementById('agent-grid').innerHTML = agents.map(a => {
+    const pct = ((a.skill_level / 4) * 100).toFixed(0);
+    const taskHtml = a.current_task
+      ? `<div class="current-task">${a.current_task}</div>`
+      : `<div class="current-task" style="color:#334155">Idle</div>`;
+    return `
+    <div class="agent-card">
+      <div class="agent-header">
+        <div class="agent-name">${a.name}</div>
+        <div class="badge ${a.status}">${a.status.replace('_',' ')}</div>
+      </div>
+      <div class="agent-role">${a.role}</div>
+      ${taskHtml}
+      <div class="stat-row">
+        <span>✅ ${a.success_count} &nbsp; ❌ ${a.error_count}</span>
+        <span>🔄 ${a.active_workflows} workflow${a.active_workflows!==1?'s':''}</span>
+      </div>
+      <div class="skill-bar-wrap">
+        <div class="skill-bar-label"><span>Skill</span><span>${a.skill_level.toFixed(1)}/4.0</span></div>
+        <div class="skill-bar"><div class="skill-bar-fill" style="width:${pct}%"></div></div>
+      </div>
+    </div>`;
+  }).join('');
+
+  // Comm log (overview)
+  renderCommLog('comm-log-overview', state.recent_communications.slice(-20).reverse());
+}
+
+function renderCommLog(id, messages) {
+  const el = document.getElementById(id);
+  if (!messages.length) { el.innerHTML = '<div class="empty">No messages yet</div>'; return; }
+  el.innerHTML = messages.map(m => `
+    <div class="comm-entry">
+      <span class="time">${fmtTime(m.timestamp)}</span>
+      <span class="from">${m.from}</span>
+      <span class="arrow">→</span>
+      <span class="to">${m.to}</span>
+      <span class="msg-type-badge ${m.type}">${m.type.replace('_',' ')}</span>
+    </div>`).join('');
+}
+
+function renderSkills() {
+  const grouped = {};
+  knowledgeData.skills.forEach(s => {
+    if (!grouped[s.agent_name]) grouped[s.agent_name] = [];
+    grouped[s.agent_name].push(s);
+  });
+
+  document.getElementById('skills-panel').innerHTML = Object.entries(grouped).map(([agent, skills]) => {
+    const totalS = skills.reduce((n,s)=>n+s.success_count,0);
+    const totalE = skills.reduce((n,s)=>n+s.error_count,0);
+    const rate = totalS+totalE > 0 ? ((totalS/(totalS+totalE))*100).toFixed(0)+'%' : '—';
+    const pills = skills.map(s =>
+      `<div class="skill-pill">
+        ${s.skill_name}
+        <span class="slevel ${s.skill_level}">${s.skill_level.toLowerCase()}</span>
+        <span class="sc">×${s.success_count}</span>
+        <span style="color:#475569;font-size:.65rem">${fmtSec(s.avg_execution_time)}</span>
+      </div>`
+    ).join('');
+    return `<div class="skills-agent-row">
+      <div class="skills-agent-name">${agent} <span class="rate">Success: ${rate}</span></div>
+      <div>${pills}</div>
+    </div>`;
+  }).join('') || '<div class="empty">No skills recorded yet</div>';
+}
+
+function renderPatterns() {
+  document.getElementById('patterns-list').innerHTML = state.workflow_patterns.map(p => `
+    <div class="pattern-card">
+      <div class="seq">${p.agent_sequence.join(' → ')}</div>
+      <div class="meta-grid">
+        <div>Uses:</div>       <div><span>${p.success_count}</span></div>
+        <div>Avg Duration:</div><div><span>${fmtSec(p.avg_duration_seconds)}</span></div>
+        <div>Avg Cost:</div>   <div><span>$${p.avg_cost_usd.toFixed(3)}</span></div>
+        <div>Success:</div>    <div><span style="color:#22c55e">100%</span></div>
+      </div>
+    </div>`).join('') || '<div class="empty">No patterns yet</div>';
+}
+
+function renderLessons() {
+  document.getElementById('lessons-list').innerHTML = knowledgeData.lessons.map(l => `
+    <div class="lesson-card">
+      <div class="title">💡 ${l.lesson_title}</div>
+      <div class="body">${l.lesson_content}</div>
+      <div class="agents">Agents: ${l.applicable_agents.join(', ')} &nbsp;|&nbsp; ${l.category}</div>
+    </div>`).join('') || '<div class="empty">No lessons captured yet</div>';
+}
+
+function renderCosts() {
+  const dailyTotal = AGENTS_COST.reduce((s,a) => s+agentDailyCost(a), 0);
+  const monthly    = dailyTotal * 30;
+  const headroom   = (5.00 / dailyTotal).toFixed(0) + 'x';
+
+  document.getElementById('cost-daily').textContent   = '$' + dailyTotal.toFixed(4);
+  document.getElementById('cost-monthly').textContent = '$' + monthly.toFixed(2);
+  document.getElementById('cost-headroom').textContent = headroom;
+
+  document.getElementById('cost-table').innerHTML = `
+    <table style="width:100%;border-collapse:collapse;font-size:.78rem">
+      <thead>
+        <tr style="color:#64748b;border-bottom:1px solid #2d3148">
+          <th style="text-align:left;padding:6px 0">Agent</th>
+          <th style="text-align:right;padding:6px 0">Calls/day</th>
+          <th style="text-align:right;padding:6px 0">Per Call</th>
+          <th style="text-align:right;padding:6px 0">Daily</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${AGENTS_COST.map(a => {
+          const pc = agentDailyCost(a) / a.calls;
+          const d  = agentDailyCost(a);
+          return `<tr style="border-bottom:1px solid #1a1d2e">
+            <td style="padding:6px 0">${a.name}</td>
+            <td style="text-align:right;color:#94a3b8">${a.calls}</td>
+            <td style="text-align:right;color:#94a3b8">$${pc.toFixed(4)}</td>
+            <td style="text-align:right;color:#e2e8f0;font-weight:600">$${d.toFixed(4)}</td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot>
+        <tr style="border-top:1px solid #2d3148;font-weight:700">
+          <td colspan="3" style="padding:8px 0;color:#a78bfa">TOTAL DAILY</td>
+          <td style="text-align:right;color:#22c55e">$${dailyTotal.toFixed(4)}</td>
+        </tr>
+      </tfoot>
+    </table>
+    <div style="margin-top:12px;font-size:.72rem;color:#64748b">
+      Daily budget: <strong style="color:#22c55e">$5.00</strong> &nbsp;|&nbsp;
+      Headroom: <strong style="color:#a78bfa">${headroom}</strong> &nbsp;|&nbsp;
+      Monthly (×30d): <strong style="color:#60a5fa">$${monthly.toFixed(2)}</strong>
+    </div>`;
+}
+
+function renderAside() {
+  // Patterns
+  document.getElementById('aside-patterns-list').innerHTML =
+    state.workflow_patterns.map(p => `
+      <div class="pattern-card">
+        <div class="seq">${p.agent_sequence.join(' → ')}</div>
+        <div class="meta-grid">
+          <div>Uses:</div>  <div><span>${p.success_count}</span></div>
+          <div>Time:</div>  <div><span>${fmtSec(p.avg_duration_seconds)}</span></div>
+          <div>Cost:</div>  <div><span>$${p.avg_cost_usd.toFixed(3)}</span></div>
+        </div>
+      </div>`).join('') || '<div class="empty">No patterns yet</div>';
+
+  // Lessons
+  document.getElementById('aside-lessons-list').innerHTML =
+    knowledgeData.lessons.map(l => `
+      <div class="lesson-card">
+        <div class="title">💡 ${l.lesson_title}</div>
+        <div class="agents">${l.applicable_agents.join(', ')}</div>
+      </div>`).join('') || '<div class="empty">No lessons yet</div>';
+
+  // Skills
+  document.getElementById('aside-skills-list').innerHTML =
+    knowledgeData.skills.map(s => `
+      <div class="skill-entry">
+        <div class="sname">${s.skill_name} <span class="slevel ${s.skill_level}">${s.skill_level.toLowerCase()}</span></div>
+        <div class="smeta">${s.agent_name} &nbsp;|&nbsp; ✅ ${s.success_count} &nbsp;|&nbsp; ⏱ ${fmtSec(s.avg_execution_time)}</div>
+      </div>`).join('') || '<div class="empty">No skills yet</div>';
+}
+
+// ============================================================================
+// VIEW ROUTING
+// ============================================================================
+let currentView = 'overview';
+function showView(view) {
+  currentView = view;
+  document.querySelectorAll('.view-block').forEach(v => v.classList.remove('active'));
+  document.getElementById('view-' + view).classList.add('active');
+  document.querySelectorAll('nav a').forEach(a => {
+    a.classList.toggle('active', a.dataset.view === view);
+  });
+  renderView(view);
+}
+
+function showAside(tab) {
+  document.querySelectorAll('.aside-tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.aside-section').forEach(s => s.classList.remove('active'));
+  event.target.classList.add('active');
+  document.getElementById('aside-' + tab).classList.add('active');
+}
+
+function renderView(view) {
+  if (view === 'overview')  { renderOverview(); }
+  if (view === 'comms')     { renderCommLog('comm-log-full', [...state.recent_communications].reverse()); }
+  if (view === 'skills')    { renderSkills(); }
+  if (view === 'patterns')  { renderPatterns(); }
+  if (view === 'lessons')   { renderLessons(); }
+  if (view === 'costs')     { renderCosts(); }
+  renderAside();
+}
+
+// ============================================================================
+// LIVE SIMULATION (cycles agent statuses while waiting for real backend)
+// ============================================================================
+const STATUS_CYCLE = ['idle','thinking','executing','waiting_approval','idle'];
+let simTick = 0;
+
+function simulateTick() {
+  simTick++;
+  // Rotate one agent's status every 5 seconds
+  const a = state.agents[simTick % state.agents.length];
+  a.status = STATUS_CYCLE[simTick % STATUS_CYCLE.length];
+  a.current_task = a.status === 'executing' ? 'Processing task #' + simTick
+                 : a.status === 'thinking'  ? 'Planning next step'
+                 : a.status === 'waiting_approval' ? 'Awaiting human approval'
+                 : null;
+
+  // Occasionally add a message
+  if (simTick % 3 === 0) {
+    const types = ['delegate','provide_output','request_input','feedback'];
+    const agents = state.agents.map(x=>x.name);
+    const from = agents[simTick % agents.length];
+    const to   = agents[(simTick + 1) % agents.length];
+    const type = types[simTick % types.length];
+    state.recent_communications.push({ from, to, type, timestamp: new Date().toISOString() });
+    if (state.recent_communications.length > 200) state.recent_communications.shift();
+  }
+
+  state.timestamp = new Date().toISOString();
+  document.getElementById('last-update').textContent = 'Updated ' + fmtTime(state.timestamp);
+}
+
+// ============================================================================
+// BACKEND POLLING (when API_URL is configured)
+// ============================================================================
+async function fetchState() {
+  if (!API_URL) return;
+  try {
+    const r = await fetch(API_URL + '/dashboard');
+    if (r.ok) state = await r.json();
+    const kr = await fetch(API_URL + '/knowledge');
+    if (kr.ok) knowledgeData = await kr.json();
+    document.getElementById('last-update').textContent = 'Live — ' + fmtTime(state.timestamp);
+  } catch (_) { /* backend not available, keep simulating */ }
+}
+
+// ============================================================================
+// CLOCK
+// ============================================================================
+function updateClock() {
+  document.getElementById('clock').textContent = new Date().toLocaleTimeString();
+}
+
+// ============================================================================
+// BOOT
+// ============================================================================
+renderView('overview');
+renderAside();
+renderCosts();
+
+setInterval(() => {
+  fetchState();
+  simulateTick();
+  renderView(currentView);
+  renderAside();
+}, 3000);
+setInterval(updateClock, 1000);
+updateClock();
+</script>
+</body>
+</html>
