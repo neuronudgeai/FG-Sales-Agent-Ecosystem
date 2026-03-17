@@ -644,7 +644,7 @@ class StageGateManager:
             name=StageGateName.CHARTER_APPROVAL,
             description="Project Charter Review & Approval",
             approver_email="tjohnson@firstgenesis.com",
-            cc_emails=[],
+            cc_emails=["pwatty@firstgenesis.com", "emaiteu@firstgenesis.com"],
             require_comment=False,
             timeout_hours=24
         ),
@@ -652,7 +652,7 @@ class StageGateManager:
             name=StageGateName.REQUIREMENTS_APPROVAL,
             description="Requirements Specification Review",
             approver_email="k.phipps@firstgenesis.com",
-            cc_emails=[],
+            cc_emails=["tjohnson@firstgenesis.com", "emaiteu@firstgenesis.com"],
             require_comment=True,
             timeout_hours=12
         ),
