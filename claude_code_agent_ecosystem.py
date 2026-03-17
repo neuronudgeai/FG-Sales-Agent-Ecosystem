@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 claude_code_agent_ecosystem.py
-Enhanced multi-agent system for First Genesis with email-based human approval gates.
-Agents pause at stage gates, email humans for approval, and resume upon response.
-Features:
+Production multi-agent system for First Genesis with:
   - Stage gate framework (5 standard gates across agents)
-  - Email notifications to humans via Outlook SMTP (customizable recipients per gate)
+  - Email notifications via Outlook SMTP (per-gate recipients)
   - Approval workflow (human replies, agent resumes automatically)
+  - Cost Controller (track spend, enforce limits)
+  - Budget Enforcer (hard stops before overspending)
+  - Hallucination Guard (detect & prevent false claims)
   - Workflow persistence (SQLite state machine)
-  - Cost control + hallucination detection
 
 Configuration:
     export ANTHROPIC_API_KEY="sk-..."
@@ -20,23 +20,24 @@ Usage:
     python claude_code_agent_ecosystem.py check_approvals
     python claude_code_agent_ecosystem.py resume_workflows
     python claude_code_agent_ecosystem.py process_approval --workflow-id <id> --approver <email> --decision <approved|rejected>
+    python claude_code_agent_ecosystem.py budget_status
+    python claude_code_agent_ecosystem.py audit_hallucinations
 """
 import anthropic
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 import sqlite3
 import hashlib
 import logging
 import smtplib
-import email
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from enum import Enum
-import time
 
 # Configure logging
 logging.basicConfig(
@@ -68,7 +69,6 @@ Risks:
   - {risk_1}: Mitigation: {mitigation_1}
 Created: {created_date}
 """,
-
         "wbs": """
 WORK BREAKDOWN STRUCTURE
 Project: {project_name}
@@ -85,7 +85,6 @@ Phase 4: Closure
   - Task 4.1: Handoff
   - Task 4.2: Lessons learned
 """,
-
         "kickoff_checklist": """
 PROJECT KICKOFF CHECKLIST
 Project: {project_name}
@@ -100,7 +99,6 @@ Project: {project_name}
 [ ] Resources allocated
 """,
     },
-
     "ba_agent": {
         "requirements": """
 REQUIREMENTS SPECIFICATION
@@ -123,7 +121,6 @@ CONSTRAINTS:
   - {constraint_1}
   - {constraint_2}
 """,
-
         "traceability_matrix": """
 REQUIREMENTS TRACEABILITY MATRIX
 Project: {project_name}
@@ -133,7 +130,6 @@ FR1 | {req_1}     | DESIGN-1  | TEST-1   | {status_1}
 FR2 | {req_2}     | DESIGN-2  | TEST-2   | {status_2}
 NFR1| {req_3}     | DESIGN-3  | TEST-3   | {status_3}
 """,
-
         "design_session_template": """
 DESIGN SESSION NOTES
 Project: {project_name}
@@ -154,7 +150,6 @@ OPEN ITEMS:
 - {open_item_2}
 """,
     },
-
     "qa_agent": {
         "qa_checklist": """
 PRE-DELIVERY QA CHECKLIST
@@ -187,26 +182,21 @@ Recommendation: READY FOR DELIVERY / NEEDS WORK
 Reviewed By: {reviewer}
 Approved By: {approver}
 """,
-
         "scope_creep_detection": """
 SCOPE CREEP DETECTION RULES
 Project: {project_name}
 Rule 1: Unplanned Features
   Trigger: New feature request not in original RFP
   Action: Alert PM, get approval before proceeding
-
 Rule 2: Timeline Variance
   Trigger: Schedule change > 10%
   Action: Alert PM and customer
-
 Rule 3: Budget Variance
   Trigger: Cost variance > 5%
   Action: Escalate to CEO if critical
-
 Rule 4: Team Changes
   Trigger: Resource additions not pre-approved
   Action: Alert PM, verify budget impact
-
 Rule 5: Requirement Changes
   Trigger: Requirements modified post-approval
   Action: Document change, get sign-off
@@ -217,7 +207,6 @@ Budget variance: {budget_variance}%
 Status: {creep_status}
 """,
     },
-
     "vendor_agent": {
         "sla_template": """
 VENDOR/PARTNER SLA
@@ -241,7 +230,6 @@ PAYMENT TERMS:
 TERMINATION CLAUSE:
   {termination_clause}
 """,
-
         "scorecard_template": """
 VENDOR PERFORMANCE SCORECARD
 Vendor: {vendor_name}
@@ -264,7 +252,6 @@ Reviewed By: {reviewer}
 Date: {review_date}
 """,
     },
-
     "manager_agent": {
         "portfolio_dashboard": """
 PORTFOLIO MANAGEMENT DASHBOARD
@@ -288,7 +275,6 @@ PENDING APPROVALS ({approval_count}):
 RISKS & BLOCKERS ({blocker_count}):
   CRITICAL: {critical_blocker}
   HIGH: {high_blocker}
-
 NEXT ACTIONS:
   [ ] {action_1} - Owner: {owner} - Due: {due_date}
   [ ] {action_2} - Owner: {owner} - Due: {due_date}
@@ -297,7 +283,6 @@ METRICS:
   On Track: {on_track}
   At Risk: {at_risk}
   Avg Project Health: {health_score}%
-
 Report Generated: {timestamp}
 """,
     }
@@ -307,7 +292,6 @@ Report Generated: {timestamp}
 # DATA MODELS
 # ============================================================================
 class StageGateName(Enum):
-    """Standard stage gates across all agents."""
     CHARTER_APPROVAL = "charter_approval"
     REQUIREMENTS_APPROVAL = "requirements_approval"
     QA_AUDIT_APPROVAL = "qa_audit_approval"
@@ -315,7 +299,6 @@ class StageGateName(Enum):
     BUDGET_ESCALATION = "budget_escalation"
 
 class WorkflowStatus(Enum):
-    """Status of a workflow at each stage gate."""
     PENDING = "pending"
     APPROVAL_SENT = "approval_sent"
     APPROVED = "approved"
@@ -325,7 +308,6 @@ class WorkflowStatus(Enum):
 
 @dataclass
 class StageGate:
-    """Definition of a stage gate."""
     name: StageGateName
     description: str
     approver_email: str
@@ -336,7 +318,6 @@ class StageGate:
 
 @dataclass
 class WorkflowState:
-    """State of an agent workflow."""
     workflow_id: str
     agent_name: str
     project_name: str
@@ -359,7 +340,7 @@ class WorkflowState:
 
 @dataclass
 class TokenCost:
-    """Track token usage and cost."""
+    """Track token usage and cost (claude-opus-4-6 pricing)."""
     input_tokens: int
     output_tokens: int
     cache_creation_tokens: int = 0
@@ -374,20 +355,42 @@ class TokenCost:
     def total_cost_usd(self) -> float:
         input_cost = (self.input_tokens / 1_000_000) * self.INPUT_COST_PER_1M
         output_cost = (self.output_tokens / 1_000_000) * self.OUTPUT_COST_PER_1M
-        cache_write_cost = (self.cache_creation_tokens / 1_000_000) * self.CACHE_WRITE_COST_PER_1M
-        cache_read_cost = (self.cache_read_tokens / 1_000_000) * self.CACHE_READ_COST_PER_1M
-        return input_cost + output_cost + cache_write_cost + cache_read_cost
+        cache_write = (self.cache_creation_tokens / 1_000_000) * self.CACHE_WRITE_COST_PER_1M
+        cache_read = (self.cache_read_tokens / 1_000_000) * self.CACHE_READ_COST_PER_1M
+        return input_cost + output_cost + cache_write + cache_read
 
     def __str__(self) -> str:
         return (f"In={self.input_tokens} Out={self.output_tokens} "
                 f"CW={self.cache_creation_tokens} CR={self.cache_read_tokens} "
                 f"Cost=${self.total_cost_usd():.4f}")
 
+@dataclass
+class AgentConfig:
+    name: str
+    budget_per_call_usd: float
+    max_daily_calls: int
+    max_daily_spend_usd: float
+    priority: int
+    description: str
+
+@dataclass
+class AgentCall:
+    agent_name: str
+    timestamp: str
+    input_tokens: int
+    output_tokens: int
+    cache_created: int
+    cache_read: int
+    cost_usd: float
+    status: str
+    reason: str
+    output_hash: str
+
 # ============================================================================
-# DATABASE & WORKFLOW STATE MANAGEMENT
+# DATABASE
 # ============================================================================
 class WorkflowDatabase:
-    """SQLite database for workflow state and approvals."""
+    """Unified SQLite database for workflows, approvals, agent calls, and hallucination flags."""
 
     def __init__(self, db_path: str = "/home/claude/fg_workflows.db"):
         self.db_path = db_path
@@ -396,7 +399,7 @@ class WorkflowDatabase:
         self._init_tables()
 
     def _init_tables(self):
-        self.cursor.execute("""
+        self.cursor.executescript("""
             CREATE TABLE IF NOT EXISTS workflows (
                 workflow_id TEXT PRIMARY KEY,
                 agent_name TEXT NOT NULL,
@@ -412,10 +415,8 @@ class WorkflowDatabase:
                 next_step_after_approval TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            )
-        """)
+            );
 
-        self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS approvals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 workflow_id TEXT NOT NULL,
@@ -425,10 +426,8 @@ class WorkflowDatabase:
                 feedback TEXT,
                 decided_at TEXT NOT NULL,
                 FOREIGN KEY(workflow_id) REFERENCES workflows(workflow_id)
-            )
-        """)
+            );
 
-        self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS agent_calls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 workflow_id TEXT,
@@ -436,15 +435,27 @@ class WorkflowDatabase:
                 timestamp TEXT NOT NULL,
                 input_tokens INTEGER NOT NULL,
                 output_tokens INTEGER NOT NULL,
+                cache_created INTEGER DEFAULT 0,
+                cache_read INTEGER DEFAULT 0,
                 cost_usd REAL NOT NULL,
                 status TEXT NOT NULL,
                 reason TEXT,
+                output_hash TEXT,
                 FOREIGN KEY(workflow_id) REFERENCES workflows(workflow_id)
-            )
-        """)
+            );
 
+            CREATE TABLE IF NOT EXISTS hallucination_flags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_name TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                flag_reason TEXT NOT NULL,
+                output_snippet TEXT
+            );
+        """)
         self.conn.commit()
-        logger.info("Workflow database initialized")
+        logger.info("Database initialized")
+
+    # ── Workflow state ────────────────────────────────────────────────────────
 
     def save_workflow_state(self, state: WorkflowState):
         self.cursor.execute("""
@@ -480,37 +491,30 @@ class WorkflowDatabase:
         )
 
     def get_pending_approvals(self) -> List[WorkflowState]:
-        self.cursor.execute("""
-            SELECT * FROM workflows WHERE status = ? ORDER BY updated_at ASC
-        """, (WorkflowStatus.APPROVAL_SENT.value,))
-        return [
-            WorkflowState(
-                workflow_id=r[0], agent_name=r[1], project_name=r[2],
-                current_stage_gate=StageGateName(r[3]), status=WorkflowStatus(r[4]),
-                content_pending_approval=r[5], content_hash=r[6],
-                approval_email_sent_at=r[7], human_approver=r[8],
-                human_feedback=r[9], approval_timestamp=r[10],
-                next_step_after_approval=r[11], created_at=r[12], updated_at=r[13]
-            )
-            for r in self.cursor.fetchall()
-        ]
+        self.cursor.execute(
+            "SELECT * FROM workflows WHERE status = ? ORDER BY updated_at ASC",
+            (WorkflowStatus.APPROVAL_SENT.value,)
+        )
+        return [self._row_to_workflow(r) for r in self.cursor.fetchall()]
 
     def get_approved_workflows_ready_to_resume(self) -> List[WorkflowState]:
         self.cursor.execute("""
             SELECT * FROM workflows WHERE status = ? AND approval_timestamp IS NOT NULL
             ORDER BY approval_timestamp ASC
         """, (WorkflowStatus.APPROVED.value,))
-        return [
-            WorkflowState(
-                workflow_id=r[0], agent_name=r[1], project_name=r[2],
-                current_stage_gate=StageGateName(r[3]), status=WorkflowStatus(r[4]),
-                content_pending_approval=r[5], content_hash=r[6],
-                approval_email_sent_at=r[7], human_approver=r[8],
-                human_feedback=r[9], approval_timestamp=r[10],
-                next_step_after_approval=r[11], created_at=r[12], updated_at=r[13]
-            )
-            for r in self.cursor.fetchall()
-        ]
+        return [self._row_to_workflow(r) for r in self.cursor.fetchall()]
+
+    def _row_to_workflow(self, r) -> WorkflowState:
+        return WorkflowState(
+            workflow_id=r[0], agent_name=r[1], project_name=r[2],
+            current_stage_gate=StageGateName(r[3]), status=WorkflowStatus(r[4]),
+            content_pending_approval=r[5], content_hash=r[6],
+            approval_email_sent_at=r[7], human_approver=r[8],
+            human_feedback=r[9], approval_timestamp=r[10],
+            next_step_after_approval=r[11], created_at=r[12], updated_at=r[13]
+        )
+
+    # ── Approvals ─────────────────────────────────────────────────────────────
 
     def record_approval(self, workflow_id: str, stage_gate: StageGateName,
                         approver_email: str, decision: str, feedback: str = None):
@@ -523,16 +527,55 @@ class WorkflowDatabase:
         self.conn.commit()
         logger.info(f"Approval recorded for {workflow_id}: {decision}")
 
-    def log_agent_call(self, workflow_id: str, agent_name: str,
-                       input_tokens: int, output_tokens: int, cost_usd: float,
-                       status: str, reason: str = None):
+    # ── Agent calls ───────────────────────────────────────────────────────────
+
+    def log_agent_call(self, call: AgentCall, workflow_id: str = None):
         self.cursor.execute("""
             INSERT INTO agent_calls
-            (workflow_id, agent_name, timestamp, input_tokens, output_tokens, cost_usd, status, reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (workflow_id, agent_name, datetime.now().isoformat(),
-              input_tokens, output_tokens, cost_usd, status, reason))
+            (workflow_id, agent_name, timestamp, input_tokens, output_tokens,
+             cache_created, cache_read, cost_usd, status, reason, output_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (workflow_id, call.agent_name, call.timestamp, call.input_tokens,
+              call.output_tokens, call.cache_created, call.cache_read,
+              call.cost_usd, call.status, call.reason, call.output_hash))
         self.conn.commit()
+
+    def get_today_spend(self) -> Tuple[float, int]:
+        today = datetime.now().strftime("%Y-%m-%d")
+        self.cursor.execute("""
+            SELECT COALESCE(SUM(cost_usd), 0), COUNT(*) FROM agent_calls
+            WHERE DATE(timestamp) = ?
+              AND status NOT IN ('rejected_budget', 'rejected_hallucination')
+        """, (today,))
+        spend, calls = self.cursor.fetchone()
+        return spend or 0.0, calls or 0
+
+    def get_agent_spend_today(self, agent_name: str) -> Tuple[float, int]:
+        today = datetime.now().strftime("%Y-%m-%d")
+        self.cursor.execute("""
+            SELECT COALESCE(SUM(cost_usd), 0), COUNT(*) FROM agent_calls
+            WHERE DATE(timestamp) = ? AND agent_name = ? AND status = 'success'
+        """, (today, agent_name))
+        spend, calls = self.cursor.fetchone()
+        return spend or 0.0, calls or 0
+
+    def get_last_n_days_spend(self, days: int = 7) -> float:
+        date_ago = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        self.cursor.execute("""
+            SELECT COALESCE(SUM(cost_usd), 0) FROM agent_calls
+            WHERE DATE(timestamp) >= ? AND status = 'success'
+        """, (date_ago,))
+        return self.cursor.fetchone()[0] or 0.0
+
+    # ── Hallucination flags ───────────────────────────────────────────────────
+
+    def log_hallucination_flag(self, agent_name: str, reason: str, snippet: str):
+        self.cursor.execute("""
+            INSERT INTO hallucination_flags (agent_name, timestamp, flag_reason, output_snippet)
+            VALUES (?, ?, ?, ?)
+        """, (agent_name, datetime.now().isoformat(), reason, snippet[:500]))
+        self.conn.commit()
+        logger.warning(f"Hallucination flagged: {agent_name} - {reason}")
 
 # ============================================================================
 # EMAIL GATEWAY (Outlook SMTP)
@@ -553,21 +596,14 @@ class EmailGateway:
         else:
             self.enabled = True
 
-    def send_approval_request(self,
-                              workflow_id: str,
-                              stage_gate: StageGate,
-                              agent_name: str,
-                              project_name: str,
-                              content_summary: str,
-                              content_detail: str) -> bool:
-        """Send approval request email to human."""
-
+    def send_approval_request(self, workflow_id: str, stage_gate: StageGate,
+                              agent_name: str, project_name: str,
+                              content_summary: str, content_detail: str) -> bool:
         if not self.enabled:
             logger.warning(f"Email disabled. Approval email for {workflow_id} not sent.")
             return False
 
         subject = f"[Approval Required] {agent_name} - {stage_gate.description} ({project_name})"
-
         body = f"""
 APPROVAL REQUEST
 Agent:        {agent_name}
@@ -594,7 +630,6 @@ Timeout: This request will auto-escalate in {stage_gate.timeout_hours} hours if 
 This is an automated message from First Genesis Agent System.
 Plain text replies only please.
 """
-
         try:
             message = MIMEMultipart()
             message["From"] = self.sender_email
@@ -607,9 +642,7 @@ Plain text replies only please.
             with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
                 server.starttls()
                 server.login(self.sender_email, self.sender_password)
-                recipients = [stage_gate.approver_email]
-                if stage_gate.cc_emails:
-                    recipients.extend(stage_gate.cc_emails)
+                recipients = [stage_gate.approver_email] + (stage_gate.cc_emails or [])
                 server.sendmail(self.sender_email, recipients, message.as_string())
 
             logger.info(f"Approval email sent for {workflow_id} to {stage_gate.approver_email}")
@@ -620,18 +653,14 @@ Plain text replies only please.
             return False
 
     def parse_approval_response(self, email_subject: str, email_body: str) -> Tuple[str, str]:
-        """Parse approval response from human email. Returns (decision, feedback)."""
         body_upper = email_body.upper()
-
         if "APPROVED" in body_upper:
             decision = "approved"
         elif "REJECTED" in body_upper:
             decision = "rejected"
         else:
             decision = "clarification_needed"
-
-        feedback = email_body.strip()
-        return decision, feedback
+        return decision, email_body.strip()
 
 # ============================================================================
 # STAGE GATE MANAGER
@@ -689,29 +718,21 @@ class StageGateManager:
     def pause_at_gate(self, workflow_id: str, agent_name: str, project_name: str,
                       stage_gate_name: StageGateName,
                       content_pending_approval: str) -> WorkflowState:
-        """Pause workflow at a stage gate and send approval email."""
-
         stage_gate = self.STAGE_GATES.get(stage_gate_name)
         if not stage_gate:
             raise ValueError(f"Unknown stage gate: {stage_gate_name}")
 
         content_hash = hashlib.sha256(content_pending_approval.encode()).hexdigest()
         workflow_state = WorkflowState(
-            workflow_id=workflow_id,
-            agent_name=agent_name,
-            project_name=project_name,
-            current_stage_gate=stage_gate_name,
-            status=WorkflowStatus.PENDING,
-            content_pending_approval=content_pending_approval,
-            content_hash=content_hash
+            workflow_id=workflow_id, agent_name=agent_name, project_name=project_name,
+            current_stage_gate=stage_gate_name, status=WorkflowStatus.PENDING,
+            content_pending_approval=content_pending_approval, content_hash=content_hash
         )
         self.db.save_workflow_state(workflow_state)
 
         email_sent = self.email.send_approval_request(
-            workflow_id=workflow_id,
-            stage_gate=stage_gate,
-            agent_name=agent_name,
-            project_name=project_name,
+            workflow_id=workflow_id, stage_gate=stage_gate,
+            agent_name=agent_name, project_name=project_name,
             content_summary=content_pending_approval[:200],
             content_detail=content_pending_approval
         )
@@ -727,18 +748,13 @@ class StageGateManager:
 
     def record_approval_response(self, workflow_id: str, approver_email: str,
                                  decision: str, feedback: str = None) -> WorkflowState:
-        """Record human approval response and update workflow state."""
-
         workflow_state = self.db.get_workflow_state(workflow_id)
         if not workflow_state:
             raise ValueError(f"Workflow not found: {workflow_id}")
 
         self.db.record_approval(
-            workflow_id=workflow_id,
-            stage_gate=workflow_state.current_stage_gate,
-            approver_email=approver_email,
-            decision=decision,
-            feedback=feedback
+            workflow_id=workflow_id, stage_gate=workflow_state.current_stage_gate,
+            approver_email=approver_email, decision=decision, feedback=feedback
         )
 
         if decision.lower() == "approved":
@@ -759,58 +775,203 @@ class StageGateManager:
         return workflow_state
 
     def get_pending_approvals_summary(self) -> str:
-        """Generate summary of pending approvals."""
         pending = self.db.get_pending_approvals()
-
         if not pending:
             return "No pending approvals"
 
         summary = f"\n{'='*70}\nPENDING APPROVALS ({len(pending)})\n{'='*70}\n"
-        for workflow in pending:
-            sent_at = datetime.fromisoformat(workflow.approval_email_sent_at)
+        for wf in pending:
+            sent_at = datetime.fromisoformat(wf.approval_email_sent_at)
             hours_waiting = (datetime.now() - sent_at).total_seconds() / 3600
-            summary += f"\n[{workflow.workflow_id}]\n"
-            summary += f"  Agent:       {workflow.agent_name}\n"
-            summary += f"  Project:     {workflow.project_name}\n"
-            summary += f"  Stage Gate:  {workflow.current_stage_gate.value}\n"
-            summary += f"  Waiting:     {hours_waiting:.1f} hours\n"
-            summary += f"  Content:     {workflow.content_pending_approval[:80]}...\n"
-        summary += "\n" + "=" * 70
-        return summary
+            summary += (f"\n[{wf.workflow_id}]\n"
+                        f"  Agent:      {wf.agent_name}\n"
+                        f"  Project:    {wf.project_name}\n"
+                        f"  Stage Gate: {wf.current_stage_gate.value}\n"
+                        f"  Waiting:    {hours_waiting:.1f} hours\n"
+                        f"  Content:    {wf.content_pending_approval[:80]}...\n")
+        return summary + "\n" + "=" * 70
 
 # ============================================================================
-# AUTONOMOUS AGENT WITH EMAIL GATES
+# BUDGET ENFORCER
+# ============================================================================
+class BudgetEnforcer:
+    """Enforces daily and per-agent budget limits."""
+
+    DAILY_BUDGET_USD = 5.00
+    ALERT_THRESHOLD = 0.80
+
+    AGENT_CONFIGS = {
+        "pm_agent": AgentConfig(
+            name="pm_agent", budget_per_call_usd=0.03, max_daily_calls=2,
+            max_daily_spend_usd=0.10, priority=1, description="Project setup, WBS, status"
+        ),
+        "ba_agent": AgentConfig(
+            name="ba_agent", budget_per_call_usd=0.04, max_daily_calls=3,
+            max_daily_spend_usd=0.15, priority=1, description="Design sessions, requirements"
+        ),
+        "qa_agent": AgentConfig(
+            name="qa_agent", budget_per_call_usd=0.06, max_daily_calls=1,
+            max_daily_spend_usd=0.10, priority=2, description="Pre-delivery audit"
+        ),
+        "vendor_agent": AgentConfig(
+            name="vendor_agent", budget_per_call_usd=0.02, max_daily_calls=1,
+            max_daily_spend_usd=0.05, priority=3, description="Partner SLA tracking"
+        ),
+        "manager_agent": AgentConfig(
+            name="manager_agent", budget_per_call_usd=0.04, max_daily_calls=1,
+            max_daily_spend_usd=0.10, priority=1, description="Portfolio dashboard"
+        ),
+    }
+
+    def __init__(self, db: WorkflowDatabase):
+        self.db = db
+
+    def can_call_agent(self, agent_name: str, estimated_cost: float) -> Tuple[bool, str]:
+        if agent_name not in self.AGENT_CONFIGS:
+            return False, f"Unknown agent: {agent_name}"
+
+        config = self.AGENT_CONFIGS[agent_name]
+        today_spend, _ = self.db.get_today_spend()
+        agent_spend, agent_calls = self.db.get_agent_spend_today(agent_name)
+
+        if today_spend + estimated_cost > self.DAILY_BUDGET_USD:
+            msg = (f"Daily budget exceeded: ${today_spend:.2f} + ${estimated_cost:.2f} "
+                   f"> ${self.DAILY_BUDGET_USD:.2f}")
+            logger.error(msg)
+            return False, msg
+
+        if agent_spend + estimated_cost > config.max_daily_spend_usd:
+            msg = (f"{agent_name} daily limit exceeded: ${agent_spend:.2f} + "
+                   f"${estimated_cost:.2f} > ${config.max_daily_spend_usd:.2f}")
+            logger.error(msg)
+            return False, msg
+
+        if agent_calls + 1 > config.max_daily_calls:
+            msg = f"{agent_name} call limit: {agent_calls} + 1 > {config.max_daily_calls}"
+            logger.error(msg)
+            return False, msg
+
+        projected = today_spend + estimated_cost
+        if projected > self.DAILY_BUDGET_USD * self.ALERT_THRESHOLD:
+            logger.warning(f"Budget alert: {agent_name} will push spend to "
+                           f"${projected:.2f} ({projected/self.DAILY_BUDGET_USD*100:.0f}%)")
+
+        return True, "Budget OK"
+
+    def get_status_report(self) -> str:
+        today_spend, today_calls = self.db.get_today_spend()
+        week_spend = self.db.get_last_n_days_spend(7)
+
+        report = (f"\n{'='*70}\n"
+                  f"BUDGET STATUS REPORT - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                  f"{'='*70}\n"
+                  f"Today's Spend:        ${today_spend:.4f} / ${self.DAILY_BUDGET_USD:.2f} "
+                  f"({today_spend/self.DAILY_BUDGET_USD*100:.1f}%)\n"
+                  f"Today's Calls:        {today_calls}\n"
+                  f"Last 7 Days:          ${week_spend:.2f}\n"
+                  f"Daily Average (7d):   ${week_spend/7:.2f}\n"
+                  f"Per-Agent Today:\n")
+
+        for agent_name, config in self.AGENT_CONFIGS.items():
+            agent_spend, agent_calls = self.db.get_agent_spend_today(agent_name)
+            pct = (agent_spend / config.max_daily_spend_usd * 100) if config.max_daily_spend_usd else 0
+            report += (f"  {agent_name:20} ${agent_spend:.4f} / ${config.max_daily_spend_usd:.2f} "
+                       f"({pct:3.0f}%) [{agent_calls} calls]\n")
+
+        return report + "\n" + "=" * 70
+
+# ============================================================================
+# HALLUCINATION GUARD
+# ============================================================================
+class HallucinationGuard:
+    """Detect and prevent agent hallucinations."""
+
+    FROZEN_FACTS = {
+        "project_timeline_aura": "3 months",
+        "project_client_aura": "Malcolm Goodwin",
+        "daily_budget": "$5 USD",
+        "team_pm": "Kiera Phipps",
+        "team_cto": "Ron Watty",
+        "team_cdo": "Trice Johnson",
+        "team_pmo": "Elina Mathieu",
+        "team_ceo": "Pascal Watty",
+        "vendor_wbt": "Yubi",
+        "deadline_wbt": "April 30, 2026"
+    }
+
+    IMPOSSIBLE_CLAIMS = [
+        (r"Chevron.*approved", "Chevron not approved yet"),
+        (r"AURA.*complete|AURA.*finished", "AURA just kicked off"),
+        (r"new hire|brought on|onboarded", "No hiring decisions made yet"),
+        (r"first genesis.*failed|bankruptcy|shutdown", "Company operational"),
+    ]
+
+    def __init__(self, db: WorkflowDatabase):
+        self.db = db
+
+    def validate_output(self, agent_name: str, output: str) -> Tuple[bool, str]:
+        output_lower = output.lower()
+
+        # Check frozen fact contradictions
+        if "aura" in agent_name or "aura" in output_lower:
+            if ("4 month" in output_lower or "6 month" in output_lower) and \
+               "3 month" not in output_lower:
+                reason = "Agent timeline contradicts frozen fact (3 months)"
+                self.db.log_hallucination_flag(agent_name, reason, output)
+                return False, reason
+
+        # Check impossible claims
+        for pattern, reason_text in self.IMPOSSIBLE_CLAIMS:
+            if re.search(pattern, output, re.IGNORECASE):
+                reason = f"Impossible claim detected: {reason_text}"
+                self.db.log_hallucination_flag(agent_name, reason, output)
+                return False, reason
+
+        # Soft warning for undocumented project claims
+        if "project" in output_lower and agent_name in ("pm_agent", "ba_agent"):
+            if "document" not in output_lower and "template" not in output_lower:
+                self.db.log_hallucination_flag(
+                    agent_name, "Warning: project claim without doc reference", output
+                )
+
+        return True, "Hallucination check passed"
+
+# ============================================================================
+# AUTONOMOUS AGENT WITH EMAIL GATES + GUARDRAILS
 # ============================================================================
 class AutonomousAgentWithEmailGates:
-    """Agent system with email-based human approval gates."""
+    """Agent system with email approval gates, budget enforcement, and hallucination detection."""
 
     def __init__(self, api_key: Optional[str] = None):
         self.client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
         self.db = WorkflowDatabase()
         self.email_gateway = EmailGateway()
         self.stage_gate_manager = StageGateManager(self.db, self.email_gateway)
-        logger.info("Agent system with email gates initialized")
+        self.budget_enforcer = BudgetEnforcer(self.db)
+        self.hallucination_guard = HallucinationGuard(self.db)
+        logger.info("Agent system initialized")
 
-    def run_pm_agent_with_gates(self, project_metadata: dict) -> Tuple[str, WorkflowState]:
-        """
-        Run PM Agent with email-based approval gate.
-        1. Agent generates project charter
-        2. Pauses at charter_approval gate
-        3. Emails approver and returns workflow state
-        """
-        workflow_id = f"pm_{project_metadata['project']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        project_name = project_metadata.get('project', 'Unknown')
+    def _call_claude(self, agent_name: str, system_prompt: str,
+                     user_message: str, workflow_id: str = None) -> Tuple[str, AgentCall]:
+        """Call Claude with budget check and hallucination validation."""
 
-        logger.info(f"Starting PM Agent workflow: {workflow_id}")
+        # Estimate cost
+        estimated_tokens = len(user_message.split()) * 1.3
+        estimated_cost = (estimated_tokens / 1_000_000) * TokenCost.INPUT_COST_PER_1M
 
-        system_prompt = """You are a Project Manager Agent for First Genesis.
-Output ONLY valid JSON. NO explanations, NO preamble."""
+        # Budget check
+        can_proceed, budget_reason = self.budget_enforcer.can_call_agent(agent_name, estimated_cost)
+        if not can_proceed:
+            call = AgentCall(
+                agent_name=agent_name, timestamp=datetime.now().isoformat(),
+                input_tokens=0, output_tokens=0, cache_created=0, cache_read=0,
+                cost_usd=0, status="rejected_budget", reason=budget_reason, output_hash=""
+            )
+            self.db.log_agent_call(call, workflow_id)
+            logger.error(f"{agent_name}: Budget rejected - {budget_reason}")
+            return "", call
 
-        user_message = f"""Generate project charter for:
-{json.dumps(project_metadata, indent=2)}
-Output as JSON only:
-{{"project_charter": {{"title": "...", "client": "...", "timeline": "..."}}, "wbs": {{}}, "risks": []}}"""
-
+        # API call
         try:
             response = self.client.messages.create(
                 model="claude-opus-4-6",
@@ -818,55 +979,90 @@ Output as JSON only:
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_message}]
             )
+        except Exception as e:
+            call = AgentCall(
+                agent_name=agent_name, timestamp=datetime.now().isoformat(),
+                input_tokens=0, output_tokens=0, cache_created=0, cache_read=0,
+                cost_usd=0, status="error", reason=str(e), output_hash=""
+            )
+            self.db.log_agent_call(call, workflow_id)
+            logger.error(f"{agent_name}: API error - {str(e)}")
+            return "", call
 
-            charter_output = response.content[0].text
-            cost = TokenCost(
-                input_tokens=response.usage.input_tokens,
-                output_tokens=response.usage.output_tokens
-            ).total_cost_usd()
-            self.db.log_agent_call(
-                workflow_id=workflow_id,
-                agent_name="pm_agent",
+        output = response.content[0].text
+        output_hash = hashlib.sha256(output.encode()).hexdigest()
+        cost = TokenCost(
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            cache_creation_tokens=getattr(response.usage, 'cache_creation_input_tokens', 0),
+            cache_read_tokens=getattr(response.usage, 'cache_read_input_tokens', 0)
+        ).total_cost_usd()
+
+        # Hallucination check
+        is_valid, hall_reason = self.hallucination_guard.validate_output(agent_name, output)
+        if not is_valid:
+            call = AgentCall(
+                agent_name=agent_name, timestamp=datetime.now().isoformat(),
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
-                cost_usd=cost,
-                status="success"
+                cache_created=getattr(response.usage, 'cache_creation_input_tokens', 0),
+                cache_read=getattr(response.usage, 'cache_read_input_tokens', 0),
+                cost_usd=cost, status="rejected_hallucination",
+                reason=hall_reason, output_hash=output_hash
             )
-            logger.info(f"PM Agent generated charter: {len(charter_output)} chars, cost ${cost:.4f}")
+            self.db.log_agent_call(call, workflow_id)
+            logger.error(f"{agent_name}: Hallucination detected - {hall_reason}")
+            return "", call
 
-        except Exception as e:
-            logger.error(f"PM Agent failed: {str(e)}")
-            self.db.log_agent_call(
-                workflow_id=workflow_id, agent_name="pm_agent",
-                input_tokens=0, output_tokens=0, cost_usd=0,
-                status="error", reason=str(e)
-            )
-            raise
+        call = AgentCall(
+            agent_name=agent_name, timestamp=datetime.now().isoformat(),
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            cache_created=getattr(response.usage, 'cache_creation_input_tokens', 0),
+            cache_read=getattr(response.usage, 'cache_read_input_tokens', 0),
+            cost_usd=cost, status="success", reason="", output_hash=output_hash
+        )
+        self.db.log_agent_call(call, workflow_id)
+        logger.info(f"{agent_name}: Success - {call}")
+        return output, call
 
-        workflow_state = self.stage_gate_manager.pause_at_gate(
-            workflow_id=workflow_id,
+    def run_pm_agent_with_gates(self, project_metadata: dict) -> Tuple[str, WorkflowState]:
+        """Run PM Agent with guardrails + charter approval gate."""
+
+        workflow_id = f"pm_{project_metadata['project']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        project_name = project_metadata.get('project', 'Unknown')
+        logger.info(f"Starting PM Agent workflow: {workflow_id}")
+
+        output, call = self._call_claude(
             agent_name="pm_agent",
-            project_name=project_name,
-            stage_gate_name=StageGateName.CHARTER_APPROVAL,
-            content_pending_approval=charter_output
+            system_prompt="You are a Project Manager Agent for First Genesis. Output ONLY valid JSON. NO explanations, NO preamble.",
+            user_message=f"""Generate project charter for:
+{json.dumps(project_metadata, indent=2)}
+Output as JSON only:
+{{"project_charter": {{"title": "...", "client": "...", "timeline": "3 months"}}, "wbs": {{}}, "risks": []}}""",
+            workflow_id=workflow_id
         )
 
+        if not output:
+            raise RuntimeError(f"PM Agent call failed: {call.reason}")
+
+        workflow_state = self.stage_gate_manager.pause_at_gate(
+            workflow_id=workflow_id, agent_name="pm_agent", project_name=project_name,
+            stage_gate_name=StageGateName.CHARTER_APPROVAL,
+            content_pending_approval=output
+        )
         logger.info(f"Workflow {workflow_id} paused at {workflow_state.current_stage_gate.value}")
-        return charter_output, workflow_state
+        return output, workflow_state
 
     def resume_approved_workflow(self, workflow_id: str) -> str:
-        """Resume a workflow that has been approved."""
-
         workflow_state = self.db.get_workflow_state(workflow_id)
         if not workflow_state:
             logger.error(f"Workflow not found: {workflow_id}")
             return ""
 
         if workflow_state.status != WorkflowStatus.APPROVED:
-            logger.warning(f"Workflow {workflow_id} not in APPROVED state: {workflow_state.status.value}")
+            logger.warning(f"Workflow {workflow_id} not APPROVED: {workflow_state.status.value}")
             return ""
-
-        logger.info(f"Resuming approved workflow: {workflow_id}")
 
         next_actions = {
             StageGateName.CHARTER_APPROVAL: "Charter approved. Ready for customer kickoff.",
@@ -883,7 +1079,6 @@ Output as JSON only:
         workflow_state.status = WorkflowStatus.COMPLETED if is_final else WorkflowStatus.RESUMED
         workflow_state.next_step_after_approval = next_action
         self.db.save_workflow_state(workflow_state)
-
         logger.info(f"Agent proceeding: {next_action}")
         return next_action
 
@@ -892,30 +1087,20 @@ Output as JSON only:
 
     def process_approval_response(self, workflow_id: str, approver_email: str,
                                   decision: str, feedback: str = None) -> str:
-        """Process a human approval response."""
         workflow_state = self.stage_gate_manager.record_approval_response(
-            workflow_id=workflow_id,
-            approver_email=approver_email,
-            decision=decision,
-            feedback=feedback
+            workflow_id=workflow_id, approver_email=approver_email,
+            decision=decision, feedback=feedback
         )
-
-        response_msg = (
-            f"\nApproval recorded for {workflow_id}:\n"
-            f"  Decision:  {decision}\n"
-            f"  Approver:  {approver_email}\n"
-            f"  Feedback:  {feedback or 'None'}\n\n"
-            f"Workflow status updated to: {workflow_state.status.value}\n"
-        )
-        logger.info(response_msg)
-        return response_msg
+        return (f"\nApproval recorded for {workflow_id}:\n"
+                f"  Decision:  {decision}\n"
+                f"  Approver:  {approver_email}\n"
+                f"  Feedback:  {feedback or 'None'}\n\n"
+                f"Workflow status updated to: {workflow_state.status.value}\n")
 
 # ============================================================================
 # MAIN ENTRY POINT
 # ============================================================================
 def main():
-    """CLI for agent operations with email gates."""
-
     if len(sys.argv) < 2:
         print("Usage: python claude_code_agent_ecosystem.py [command]")
         print("\nCommands:")
@@ -927,6 +1112,8 @@ def main():
         print("    --approver <email>")
         print("    --decision <approved|rejected>")
         print("    --feedback <comment>")
+        print("  budget_status             Show budget usage report")
+        print("  audit_hallucinations      Show recent hallucination flags")
         sys.exit(1)
 
     agent = AutonomousAgentWithEmailGates()
@@ -939,22 +1126,20 @@ def main():
                 "client": "Malcolm Goodwin",
                 "project": "AURA MVP",
                 "timeline_weeks": 12,
-                "scope": "Silhouette technology + 3D mesh design"
+                "scope": "Silhouette technology + 3D mesh design + actor model"
             })
-
+            gate = StageGateManager.STAGE_GATES[StageGateName.CHARTER_APPROVAL]
             print("\n" + "=" * 70)
             print(f"WORKFLOW CREATED: {workflow_state.workflow_id}")
             print("=" * 70)
             print(f"Status:      {workflow_state.status.value}")
             print(f"Stage Gate:  {workflow_state.current_stage_gate.value}")
-            print(f"Sent To:     {StageGateManager.STAGE_GATES[StageGateName.CHARTER_APPROVAL].approver_email}")
-            print(f"Awaiting:    Approval via email")
-            print("\nGenerated Charter (preview):")
-            print(charter[:300] + "...")
+            print(f"Sent To:     {gate.approver_email}")
+            print(f"CC:          {', '.join(gate.cc_emails)}")
+            print(f"\nGenerated Charter (preview):\n{charter[:300]}...")
             print("\n" + "=" * 70)
             print("Agent paused at stage gate. Awaiting approval email.")
             print("=" * 70)
-
         except Exception as e:
             logger.error(f"Error: {str(e)}")
             print(f"ERROR: {str(e)}")
@@ -964,15 +1149,13 @@ def main():
 
     elif command == "resume_workflows":
         logger.info("Resuming approved workflows...")
-        pending_approved = agent.db.get_approved_workflows_ready_to_resume()
-
-        if not pending_approved:
+        pending = agent.db.get_approved_workflows_ready_to_resume()
+        if not pending:
             print("No approved workflows ready to resume.")
         else:
-            for workflow in pending_approved:
-                result = agent.resume_approved_workflow(workflow.workflow_id)
-                print(f"\nResumed {workflow.workflow_id}")
-                print(f"   Next step: {result}")
+            for wf in pending:
+                result = agent.resume_approved_workflow(wf.workflow_id)
+                print(f"\nResumed {wf.workflow_id}\n   Next step: {result}")
 
     elif command == "process_approval":
         kwargs = {}
@@ -992,8 +1175,27 @@ def main():
         if 'workflow_id' not in kwargs:
             print("ERROR: --workflow-id required")
             sys.exit(1)
-
         print(agent.process_approval_response(**kwargs))
+
+    elif command == "budget_status":
+        print(agent.budget_enforcer.get_status_report())
+
+    elif command == "audit_hallucinations":
+        agent.db.cursor.execute(
+            "SELECT * FROM hallucination_flags ORDER BY timestamp DESC LIMIT 10"
+        )
+        flags = agent.db.cursor.fetchall()
+        print("\n" + "=" * 70)
+        print("HALLUCINATION FLAGS (Last 10)")
+        print("=" * 70)
+        if not flags:
+            print("No hallucination flags detected")
+        else:
+            for flag_id, agent_name, timestamp, reason, snippet in flags:
+                print(f"\n[{flag_id}] {agent_name} @ {timestamp}")
+                print(f"  Reason:  {reason}")
+                if snippet:
+                    print(f"  Snippet: {snippet[:80]}...")
 
     else:
         print(f"Unknown command: {command}")
