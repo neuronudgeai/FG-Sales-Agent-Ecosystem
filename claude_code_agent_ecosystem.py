@@ -28,9 +28,13 @@ import json
 import os
 import re
 import sys
+import uuid
+import threading
+import queue
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+from abc import ABC, abstractmethod
 import sqlite3
 import hashlib
 import logging
@@ -385,6 +389,91 @@ class AgentCall:
     status: str
     reason: str
     output_hash: str
+
+# ============================================================================
+# DASHBOARD: ENUMS & DATACLASSES
+# ============================================================================
+class AgentStatus(Enum):
+    IDLE = "idle"
+    THINKING = "thinking"
+    WAITING_INPUT = "waiting_input"
+    EXECUTING = "executing"
+    WAITING_APPROVAL = "waiting_approval"
+    COMPLETE = "complete"
+    ERROR = "error"
+
+class SkillLevel(Enum):
+    NOVICE = 1
+    INTERMEDIATE = 2
+    ADVANCED = 3
+    EXPERT = 4
+
+class MessageType(Enum):
+    INITIATE = "initiate"
+    REQUEST_INPUT = "request_input"
+    PROVIDE_OUTPUT = "provide_output"
+    DELEGATE = "delegate"
+    FEEDBACK = "feedback"
+    ESCALATE = "escalate"
+
+@dataclass
+class AgentRecord:
+    """Agent state and metadata for dashboard monitoring."""
+    id: str
+    name: str
+    role: str
+    status: AgentStatus
+    current_task: Optional[str]
+    skill_level: SkillLevel
+    success_count: int
+    error_count: int
+    last_activity: str
+    active_workflows: List[str]
+
+    def __post_init__(self):
+        if not self.id:
+            self.id = f"{self.name}_{uuid.uuid4().hex[:8]}"
+
+@dataclass
+class AgentMessage:
+    """Message between agents via the communication bus."""
+    id: str
+    from_agent: str
+    to_agent: str
+    message_type: MessageType
+    content: Dict
+    timestamp: str
+    status: str  # pending, sent, acknowledged, completed
+
+@dataclass
+class AgentSkill:
+    """Learned capability tracked per agent."""
+    skill_id: str
+    agent_name: str
+    skill_name: str
+    description: str
+    success_count: int
+    error_count: int
+    avg_execution_time: float
+    skill_level: SkillLevel
+    last_used: str
+    template: Dict
+
+@dataclass
+class WorkflowExecution:
+    """Record of a complete workflow execution for pattern capture."""
+    workflow_id: str
+    agent_sequence: List[str]
+    start_time: str
+    end_time: str
+    duration_seconds: float
+    success: bool
+    input_data: Dict
+    output_data: Dict
+    errors: List[str]
+    approvals_needed: int
+    approvals_completed: int
+    cost_usd: float
 
 # ============================================================================
 # DATABASE
@@ -1098,6 +1187,484 @@ Output as JSON only:
                 f"Workflow status updated to: {workflow_state.status.value}\n")
 
 # ============================================================================
+# DASHBOARD: KNOWLEDGE LIBRARY
+# ============================================================================
+class KnowledgeLibrary:
+    """SQLite database for agent learning, workflow patterns, and lessons."""
+
+    def __init__(self, db_path: str = "/home/claude/fg_knowledge.db"):
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._init_tables()
+
+    def _init_tables(self):
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS skills (
+                skill_id TEXT PRIMARY KEY,
+                agent_name TEXT,
+                skill_name TEXT,
+                description TEXT,
+                success_count INTEGER DEFAULT 0,
+                error_count INTEGER DEFAULT 0,
+                avg_execution_time REAL,
+                skill_level TEXT,
+                last_used TEXT,
+                template TEXT,
+                created_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS workflow_patterns (
+                workflow_id TEXT PRIMARY KEY,
+                workflow_name TEXT,
+                agent_sequence TEXT,
+                success_count INTEGER DEFAULT 0,
+                avg_duration_seconds REAL,
+                avg_cost_usd REAL,
+                template TEXT,
+                created_at TEXT,
+                last_used TEXT
+            );
+            CREATE TABLE IF NOT EXISTS lessons_learned (
+                lesson_id TEXT PRIMARY KEY,
+                workflow_id TEXT,
+                lesson_title TEXT,
+                lesson_content TEXT,
+                category TEXT,
+                applicable_agents TEXT,
+                created_at TEXT,
+                usage_count INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS agent_comm_log (
+                message_id TEXT PRIMARY KEY,
+                from_agent TEXT,
+                to_agent TEXT,
+                message_type TEXT,
+                content TEXT,
+                timestamp TEXT,
+                status TEXT
+            );
+        """)
+        self.conn.commit()
+
+    def save_skill(self, skill: AgentSkill):
+        self.conn.execute("""
+            INSERT OR REPLACE INTO skills
+            (skill_id, agent_name, skill_name, description, success_count,
+             error_count, avg_execution_time, skill_level, last_used, template, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            skill.skill_id, skill.agent_name, skill.skill_name, skill.description,
+            skill.success_count, skill.error_count, skill.avg_execution_time,
+            skill.skill_level.name, skill.last_used, json.dumps(skill.template),
+            datetime.now().isoformat()
+        ))
+        self.conn.commit()
+
+    def get_agent_skills(self, agent_name: str) -> List[AgentSkill]:
+        cursor = self.conn.execute(
+            "SELECT * FROM skills WHERE agent_name = ?", (agent_name,)
+        )
+        skills = []
+        for row in cursor.fetchall():
+            skills.append(AgentSkill(
+                skill_id=row[0], agent_name=row[1], skill_name=row[2],
+                description=row[3], success_count=row[4], error_count=row[5],
+                avg_execution_time=row[6], skill_level=SkillLevel[row[7]],
+                last_used=row[8], template=json.loads(row[9]) if row[9] else {}
+            ))
+        return skills
+
+    def save_workflow_pattern(self, workflow: WorkflowExecution):
+        workflow_name = "-".join(workflow.agent_sequence)
+        self.conn.execute("""
+            INSERT OR REPLACE INTO workflow_patterns
+            (workflow_id, workflow_name, agent_sequence, success_count,
+             avg_duration_seconds, avg_cost_usd, template, created_at, last_used)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            workflow.workflow_id, workflow_name,
+            json.dumps(workflow.agent_sequence), 1,
+            workflow.duration_seconds, workflow.cost_usd,
+            json.dumps({"input": workflow.input_data, "agent_sequence": workflow.agent_sequence}),
+            datetime.now().isoformat(), datetime.now().isoformat()
+        ))
+        self.conn.commit()
+
+    def get_workflow_patterns(self) -> List[Dict]:
+        cursor = self.conn.execute(
+            "SELECT * FROM workflow_patterns ORDER BY success_count DESC"
+        )
+        patterns = []
+        for row in cursor.fetchall():
+            patterns.append({
+                "workflow_id": row[0], "workflow_name": row[1],
+                "agent_sequence": json.loads(row[2]), "success_count": row[3],
+                "avg_duration_seconds": row[4], "avg_cost_usd": row[5],
+                "template": json.loads(row[6]) if row[6] else None
+            })
+        return patterns
+
+    def save_lesson_learned(self, workflow_id: str, lesson_title: str,
+                            lesson_content: str, category: str,
+                            applicable_agents: List[str]):
+        self.conn.execute("""
+            INSERT INTO lessons_learned
+            (lesson_id, workflow_id, lesson_title, lesson_content, category,
+             applicable_agents, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(uuid.uuid4()), workflow_id, lesson_title, lesson_content,
+            category, json.dumps(applicable_agents), datetime.now().isoformat()
+        ))
+        self.conn.commit()
+
+    def get_lessons_learned(self, category: Optional[str] = None) -> List[Dict]:
+        if category:
+            cursor = self.conn.execute(
+                "SELECT * FROM lessons_learned WHERE category = ? ORDER BY created_at DESC",
+                (category,)
+            )
+        else:
+            cursor = self.conn.execute(
+                "SELECT * FROM lessons_learned ORDER BY created_at DESC"
+            )
+        lessons = []
+        for row in cursor.fetchall():
+            lessons.append({
+                "lesson_id": row[0], "workflow_id": row[1], "lesson_title": row[2],
+                "lesson_content": row[3], "category": row[4],
+                "applicable_agents": json.loads(row[5]), "created_at": row[6],
+                "usage_count": row[7]
+            })
+        return lessons
+
+
+# ============================================================================
+# DASHBOARD: AGENT COMMUNICATION BUS
+# ============================================================================
+class AgentCommunicationBus:
+    """Message bus for inter-agent communication."""
+
+    MAX_HISTORY = 10_000
+
+    def __init__(self, knowledge_library: KnowledgeLibrary):
+        self.knowledge_library = knowledge_library
+        self.message_queue: queue.Queue = queue.Queue()
+        self.message_history: List[AgentMessage] = []
+        self.agents: Dict[str, AgentRecord] = {}
+
+    def register_agent(self, agent: AgentRecord):
+        self.agents[agent.name] = agent
+
+    def send_message(self, from_agent: str, to_agent: str,
+                     message_type: MessageType, content: Dict) -> str:
+        message_id = str(uuid.uuid4())
+        msg = AgentMessage(
+            id=message_id, from_agent=from_agent, to_agent=to_agent,
+            message_type=message_type, content=content,
+            timestamp=datetime.now().isoformat(), status="sent"
+        )
+        self.message_queue.put(msg)
+        self.message_history.append(msg)
+        if len(self.message_history) > self.MAX_HISTORY:
+            self.message_history = self.message_history[-self.MAX_HISTORY:]
+        return message_id
+
+    def get_messages_for_agent(self, agent_name: str) -> List[AgentMessage]:
+        return [m for m in self.message_history if m.to_agent == agent_name]
+
+    def get_conversation(self, agent1: str, agent2: str) -> List[AgentMessage]:
+        return [
+            m for m in self.message_history
+            if (m.from_agent == agent1 and m.to_agent == agent2) or
+               (m.from_agent == agent2 and m.to_agent == agent1)
+        ]
+
+
+# ============================================================================
+# DASHBOARD: SKILL COMPOUNDING ENGINE
+# ============================================================================
+class SkillCompoundingEngine:
+    """Tracks and improves agent skills over time."""
+
+    def __init__(self, knowledge_library: KnowledgeLibrary):
+        self.knowledge_library = knowledge_library
+
+    def record_success(self, agent_name: str, skill_name: str,
+                       execution_time: float, output_quality: float = 1.0):
+        skills = self.knowledge_library.get_agent_skills(agent_name)
+        skill = next((s for s in skills if s.skill_name == skill_name), None)
+        if not skill:
+            skill = AgentSkill(
+                skill_id=str(uuid.uuid4()), agent_name=agent_name,
+                skill_name=skill_name, description=f"Skill learned by {agent_name}",
+                success_count=0, error_count=0, avg_execution_time=0,
+                skill_level=SkillLevel.NOVICE, last_used=datetime.now().isoformat(),
+                template={}
+            )
+        skill.success_count += 1
+        skill.last_used = datetime.now().isoformat()
+        if skill.success_count >= 50:
+            skill.skill_level = SkillLevel.EXPERT
+        elif skill.success_count >= 20:
+            skill.skill_level = SkillLevel.ADVANCED
+        elif skill.success_count >= 5:
+            skill.skill_level = SkillLevel.INTERMEDIATE
+        if skill.avg_execution_time == 0:
+            skill.avg_execution_time = execution_time
+        else:
+            skill.avg_execution_time = (
+                (skill.avg_execution_time * (skill.success_count - 1) + execution_time)
+                / skill.success_count
+            )
+        self.knowledge_library.save_skill(skill)
+
+    def record_error(self, agent_name: str, skill_name: str, error: str):
+        skills = self.knowledge_library.get_agent_skills(agent_name)
+        skill = next((s for s in skills if s.skill_name == skill_name), None)
+        if skill:
+            skill.error_count += 1
+            self.knowledge_library.save_skill(skill)
+
+    def get_agent_improvement(self, agent_name: str) -> Dict:
+        skills = self.knowledge_library.get_agent_skills(agent_name)
+        total_successes = sum(s.success_count for s in skills)
+        total_errors = sum(s.error_count for s in skills)
+        avg_level = sum(s.skill_level.value for s in skills) / len(skills) if skills else 0
+        total = total_successes + total_errors
+        return {
+            "agent_name": agent_name,
+            "total_skills": len(skills),
+            "total_successes": total_successes,
+            "total_errors": total_errors,
+            "success_rate": total_successes / total if total > 0 else 0,
+            "avg_skill_level": avg_level,
+            "skills": [asdict(s) for s in skills]
+        }
+
+
+# ============================================================================
+# DASHBOARD: STATE MANAGER & COMMAND CENTER
+# ============================================================================
+class DashboardStateManager:
+    """Manages complete state for real-time dashboard display."""
+
+    def __init__(self):
+        self.knowledge_library = KnowledgeLibrary()
+        self.communication_bus = AgentCommunicationBus(self.knowledge_library)
+        self.skill_engine = SkillCompoundingEngine(self.knowledge_library)
+        self.agents: Dict[str, AgentRecord] = {}
+        self.last_update = datetime.now().isoformat()
+
+    def register_agent(self, agent: AgentRecord):
+        self.agents[agent.name] = agent
+        self.communication_bus.register_agent(agent)
+
+    def update_agent_status(self, agent_name: str, status: AgentStatus,
+                            current_task: Optional[str] = None):
+        if agent_name in self.agents:
+            self.agents[agent_name].status = status
+            self.agents[agent_name].current_task = current_task
+            self.agents[agent_name].last_activity = datetime.now().isoformat()
+            self.last_update = datetime.now().isoformat()
+
+    def get_dashboard_data(self) -> Dict:
+        agents_data = []
+        for agent_name, agent in self.agents.items():
+            agents_data.append({
+                "name": agent.name, "role": agent.role,
+                "status": agent.status.value, "current_task": agent.current_task,
+                "skill_level": agent.skill_level.value,
+                "success_count": agent.success_count, "error_count": agent.error_count,
+                "last_activity": agent.last_activity,
+                "active_workflows": len(agent.active_workflows)
+            })
+        recent_messages = [
+            {"from": m.from_agent, "to": m.to_agent,
+             "type": m.message_type.value, "timestamp": m.timestamp}
+            for m in self.communication_bus.message_history[-100:]
+        ]
+        patterns = self.knowledge_library.get_workflow_patterns()
+        return {
+            "timestamp": self.last_update,
+            "agents": agents_data,
+            "recent_communications": recent_messages,
+            "workflow_patterns": patterns,
+            "lessons_learned_count": len(self.knowledge_library.get_lessons_learned()),
+            "total_skills": sum(
+                len(self.skill_engine.get_agent_improvement(name)["skills"])
+                for name in self.agents
+            )
+        }
+
+
+class CommandCenter:
+    """API surface for command center and dashboard queries."""
+
+    def __init__(self, state_manager: DashboardStateManager):
+        self.state = state_manager
+
+    def get_dashboard(self) -> Dict:
+        return self.state.get_dashboard_data()
+
+    def get_agent_details(self, agent_name: str) -> Dict:
+        agent = self.state.agents.get(agent_name)
+        if not agent:
+            return {"error": f"Agent {agent_name} not found"}
+        improvement = self.state.skill_engine.get_agent_improvement(agent_name)
+        recent_messages = self.state.communication_bus.get_messages_for_agent(agent_name)
+        return {
+            "agent": asdict(agent),
+            "improvement_metrics": improvement,
+            "recent_messages": [
+                {"from": m.from_agent, "type": m.message_type.value,
+                 "timestamp": m.timestamp}
+                for m in recent_messages[-20:]
+            ]
+        }
+
+    def get_workflow_patterns(self) -> List[Dict]:
+        return self.state.knowledge_library.get_workflow_patterns()
+
+    def get_lessons_learned(self, category: Optional[str] = None) -> List[Dict]:
+        return self.state.knowledge_library.get_lessons_learned(category)
+
+    def get_conversation_log(self, agent1: str, agent2: str) -> List[Dict]:
+        messages = self.state.communication_bus.get_conversation(agent1, agent2)
+        return [
+            {"from": m.from_agent, "to": m.to_agent, "type": m.message_type.value,
+             "content": m.content, "timestamp": m.timestamp}
+            for m in messages
+        ]
+
+    def get_skill_progression(self, agent_name: str) -> Dict:
+        return self.state.skill_engine.get_agent_improvement(agent_name)
+
+    def send_agent_message(self, from_agent: str, to_agent: str,
+                           message_type: str, content: Dict) -> str:
+        msg_type = MessageType[message_type.upper()]
+        return self.state.communication_bus.send_message(
+            from_agent, to_agent, msg_type, content
+        )
+
+
+# ============================================================================
+# DASHBOARD: DEMO / SMOKE TEST
+# ============================================================================
+def demo_dashboard():
+    """Demonstrate dashboard system with simulated agent activity."""
+
+    print("\n" + "=" * 70)
+    print("AGENT DASHBOARD & COMMAND CENTER DEMO")
+    print("=" * 70 + "\n")
+
+    state = DashboardStateManager()
+    command_center = CommandCenter(state)
+
+    # Register agents
+    agents = [
+        AgentRecord("pm_1",     "PM Agent",     "Project Manager",   AgentStatus.IDLE,     None,           SkillLevel.INTERMEDIATE, 5, 0, datetime.now().isoformat(), []),
+        AgentRecord("ba_1",     "BA Agent",     "Business Analyst",  AgentStatus.THINKING, "Requirements", SkillLevel.INTERMEDIATE, 3, 0, datetime.now().isoformat(), []),
+        AgentRecord("qa_1",     "QA Agent",     "Quality Assurance", AgentStatus.IDLE,     None,           SkillLevel.NOVICE,       2, 1, datetime.now().isoformat(), []),
+        AgentRecord("vendor_1", "Vendor Agent", "Vendor Manager",    AgentStatus.IDLE,     None,           SkillLevel.NOVICE,       1, 0, datetime.now().isoformat(), []),
+        AgentRecord("mgr_1",    "Manager Agent","Portfolio Manager",  AgentStatus.IDLE,     None,           SkillLevel.INTERMEDIATE, 4, 0, datetime.now().isoformat(), []),
+    ]
+    for a in agents:
+        state.register_agent(a)
+
+    # Simulate inter-agent communication
+    print("1. SIMULATING AGENT COMMUNICATION:")
+    print("-" * 70)
+    msg_id = state.communication_bus.send_message(
+        "PM Agent", "BA Agent", MessageType.DELEGATE,
+        {"task": "Extract requirements from AURA design session"}
+    )
+    print(f"   PM Agent → BA Agent: 'Extract requirements'  [ID: {msg_id[:8]}...]")
+    state.communication_bus.send_message(
+        "BA Agent", "PM Agent", MessageType.PROVIDE_OUTPUT,
+        {"requirements": ["FR1: Silhouette processing", "FR2: 3D mesh export", "FR3: Actor model tagging"]}
+    )
+    print(f"   BA Agent → PM Agent: Provided 3 requirements")
+    state.communication_bus.send_message(
+        "PM Agent", "QA Agent", MessageType.REQUEST_INPUT,
+        {"task": "Review charter quality before gate submission"}
+    )
+    print(f"   PM Agent → QA Agent: 'Review charter quality'\n")
+
+    # Record skill executions
+    print("2. RECORDING SKILL IMPROVEMENTS:")
+    print("-" * 70)
+    state.skill_engine.record_success("PM Agent", "create_charter",          120.5, 0.95)
+    state.skill_engine.record_success("PM Agent", "create_charter",          115.0, 0.98)
+    state.skill_engine.record_success("BA Agent", "extract_requirements",    180.0, 0.92)
+    state.skill_engine.record_success("QA Agent", "audit_deliverable",       90.0,  0.88)
+    state.skill_engine.record_success("Manager Agent", "portfolio_review",   60.0,  0.96)
+    print("   ✅ PM Agent:      create_charter (×2, avg 117.75s)")
+    print("   ✅ BA Agent:      extract_requirements (×1, avg 180s)")
+    print("   ✅ QA Agent:      audit_deliverable (×1, avg 90s)")
+    print("   ✅ Manager Agent: portfolio_review (×1, avg 60s)\n")
+
+    # Show progression
+    print("3. AGENT SKILL PROGRESSION:")
+    print("-" * 70)
+    for agent_name in ["PM Agent", "BA Agent", "QA Agent"]:
+        m = state.skill_engine.get_agent_improvement(agent_name)
+        print(f"   {agent_name}: {m['total_skills']} skill(s) | "
+              f"Success rate {m['success_rate']*100:.0f}% | "
+              f"Avg level {m['avg_skill_level']:.1f}/4")
+
+    # Save workflow pattern
+    print("\n4. CAPTURING WORKFLOW PATTERNS:")
+    print("-" * 70)
+    wf = WorkflowExecution(
+        workflow_id=str(uuid.uuid4()),
+        agent_sequence=["PM Agent", "BA Agent", "QA Agent"],
+        start_time=datetime.now().isoformat(),
+        end_time=datetime.now().isoformat(),
+        duration_seconds=300, success=True,
+        input_data={"project": "AURA MVP"},
+        output_data={"charter_approved": True},
+        errors=[], approvals_needed=1, approvals_completed=1, cost_usd=0.03
+    )
+    state.knowledge_library.save_workflow_pattern(wf)
+    print("   ✅ Pattern saved: PM Agent → BA Agent → QA Agent")
+
+    # Save lesson learned
+    print("\n5. CAPTURING LESSONS LEARNED:")
+    print("-" * 70)
+    state.knowledge_library.save_lesson_learned(
+        wf.workflow_id,
+        "Charter quality improves with design session review",
+        "When BA Agent reviews design sessions first, PM Agent creates better charters",
+        "process_optimization", ["PM Agent", "BA Agent"]
+    )
+    print("   ✅ Lesson: Charter quality improves with design session review")
+
+    # Dashboard snapshot
+    print("\n6. DASHBOARD SNAPSHOT:")
+    print("-" * 70)
+    dashboard = command_center.get_dashboard()
+    print(f"   Agents Online:           {len(dashboard['agents'])}")
+    for a in dashboard['agents']:
+        print(f"     • {a['name']:<16} {a['status']:<20} (skill lvl {a['skill_level']}/4)")
+    print(f"   Recent Communications:   {len(dashboard['recent_communications'])}")
+    print(f"   Workflow Patterns:        {len(dashboard['workflow_patterns'])}")
+    print(f"   Lessons Learned:          {dashboard['lessons_learned_count']}")
+    print(f"   Total Skills Tracked:     {dashboard['total_skills']}")
+
+    print("\n" + "=" * 70)
+    print("DASHBOARD & COMMAND CENTER CAPABILITIES")
+    print("=" * 70)
+    print("""
+  ✅ AGENT MONITORING    — Real-time status, task, success/error counts
+  ✅ INTER-AGENT COMMS   — Message bus (6 types: initiate/delegate/feedback…)
+  ✅ SKILL COMPOUNDING   — Novice → Intermediate → Advanced → Expert (50+)
+  ✅ KNOWLEDGE LIBRARY   — Reusable workflow patterns + lessons learned
+  ✅ PERFORMANCE METRICS — Success rate, avg skill level, progression
+  ✅ COMMAND CENTER API  — Dashboard, agent details, conversation log
+    """)
+
+
+# ============================================================================
 # TOKEN STRATEGY: PRICING & COST MODELS
 # ============================================================================
 class TokenPricing:
@@ -1397,12 +1964,18 @@ def main():
         print("  project_monthly_cost      Monthly cost scenarios")
         print("  show_executive_summary    Complete executive summary")
         print("  token_dashboard           Full token strategy dashboard")
+        print("\nDashboard & Command Center Commands:")
+        print("  demo_dashboard            Run dashboard demo with simulated agents")
         sys.exit(1)
 
     command = sys.argv[1]
 
+    # ── Dashboard commands (no DB/API needed) ─────────────────────────────────
+    if command == "demo_dashboard":
+        demo_dashboard(); return
+
     # ── Token strategy commands (no DB/API needed) ────────────────────────────
-    if command == "show_budget_model":
+    elif command == "show_budget_model":
         show_budget_model(); return
     elif command == "show_cost_breakdown":
         show_cost_breakdown(); return
@@ -1416,6 +1989,7 @@ def main():
         show_token_dashboard(); return
 
     # ── Agent commands (require DB + API) ────────────────────────────────────
+
     agent = AutonomousAgentWithEmailGates()
 
     if command == "run_pm_agent":
