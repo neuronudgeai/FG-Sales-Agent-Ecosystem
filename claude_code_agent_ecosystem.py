@@ -399,8 +399,8 @@ class EmailGateway:
     """Email notification system"""
 
     def __init__(self):
-        self.sender = os.environ.get("GMAIL_SENDER")
-        self.password = os.environ.get("GMAIL_PASSWORD")
+        self.sender = os.environ.get("OUTLOOK_SENDER")
+        self.password = os.environ.get("OUTLOOK_PASSWORD")
         self.enabled = bool(self.sender and self.password)
 
     def send_approval_request(self, workflow_id: str, stage_gate: str,
@@ -430,7 +430,7 @@ Timeout: 24 hours
             msg["Subject"] = subject
             msg.attach(MIMEText(body, "plain"))
 
-            with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            with smtplib.SMTP("smtp.office365.com", 587) as server:
                 server.starttls()
                 server.login(self.sender, self.password)
                 server.sendmail(self.sender, [approver_email], msg.as_string())
