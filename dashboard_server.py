@@ -630,6 +630,71 @@ def api_audit_log():
     ]})
 
 # ============================================================================
+# REST API — EXECUTIVE (Portfolio & Approvals)
+# ============================================================================
+_PORTFOLIO_DATA = {
+    "summary": {
+        "total_value": 2750000, "total_spent": 687500,
+        "projects_on_track": 3, "projects_total": 4,
+        "projects_at_risk": 1, "pending_approvals": 3, "blocked_count": 1,
+    },
+    "projects": [
+        {"name": "AURA MVP",          "status": "On Track",    "owner": "Kiera",   "risk": "green",
+         "budget": 150000,  "spent": 37500,  "progress": 25, "phase": "Design"},
+        {"name": "Chevron Sand Mgmt", "status": "In Progress", "owner": "Elina",   "risk": "amber",
+         "budget": 800000,  "spent": 360000, "progress": 45, "phase": "Development"},
+        {"name": "WWT Enhancement",   "status": "At Risk",     "owner": "Ron",     "risk": "red",
+         "budget": 200000,  "spent": 160000, "progress": 80, "phase": "UAT"},
+        {"name": "Middle East",       "status": "Active",      "owner": "Partner", "risk": "green",
+         "budget": 1600000, "spent": 130000, "progress": 8,  "phase": "Initiation"},
+    ],
+    "risks": [
+        {"level": "red",   "label": "WWT UAT delays — 80% budget used, deadline at risk",    "owner": "Ron"},
+        {"level": "amber", "label": "Chevron GPU resource constraint — blocking development", "owner": "Elina"},
+        {"level": "green", "label": "AURA MVP on schedule — design phase progressing well",   "owner": "Kiera"},
+        {"level": "green", "label": "Middle East — partnership agreement in final review",    "owner": "Partner"},
+    ],
+    "financials": {
+        "total_budget": 2750000, "total_spent": 687500, "remaining": 2062500,
+        "burn_rate_pct": 25.0, "ai_agent_daily_cost": 0.20, "cost_headroom": 25,
+    },
+}
+
+_APPROVALS_DATA = {
+    "queue": [
+        {"project": "AURA MVP",          "stage": "Charter Approval",    "agent": "PM Agent",
+         "waiting_hours": 2.3,  "approver": "trice@firstgenesis.com"},
+        {"project": "Chevron Sand Mgmt", "stage": "Requirements Review", "agent": "BA Agent",
+         "waiting_hours": 4.1,  "approver": "trice@firstgenesis.com"},
+        {"project": "WWT Enhancement",   "stage": "Delivery Approval",   "agent": "QA Agent",
+         "waiting_hours": 19.5, "approver": "trice@firstgenesis.com"},
+    ],
+    "history": [
+        {"date": "Mar 11", "count": 4, "avg_hours": 1.9},
+        {"date": "Mar 12", "count": 3, "avg_hours": 2.8},
+        {"date": "Mar 13", "count": 6, "avg_hours": 1.2},
+        {"date": "Mar 14", "count": 2, "avg_hours": 3.2},
+        {"date": "Mar 15", "count": 5, "avg_hours": 1.5},
+        {"date": "Mar 16", "count": 3, "avg_hours": 2.1},
+        {"date": "Mar 17", "count": 4, "avg_hours": 1.8},
+    ],
+    "metrics": {
+        "pending_count": 3, "oldest_hours": 19.5,
+        "avg_turnaround_hours": 2.1, "week_total": 27, "on_time_rate_pct": 94,
+    },
+}
+
+@app.route("/api/portfolio")
+def api_portfolio():
+    AuditTrail.log_access(request.args.get("user", "anonymous"), "portfolio")
+    return jsonify(_PORTFOLIO_DATA)
+
+@app.route("/api/approvals")
+def api_approvals():
+    AuditTrail.log_access(request.args.get("user", "anonymous"), "approvals")
+    return jsonify(_APPROVALS_DATA)
+
+# ============================================================================
 # ERROR HANDLERS
 # ============================================================================
 @app.errorhandler(404)

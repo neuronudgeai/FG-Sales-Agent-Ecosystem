@@ -226,6 +226,75 @@
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: #2d3148; border-radius: 3px; }
+
+    /* ── Executive / Portfolio ──────────────────────────────────────────────── */
+    .kpi.red .value { color: #f87171; }
+    .risk-badge {
+      display: inline-block; padding: 2px 9px; border-radius: 20px;
+      font-size: .65rem; font-weight: 700; text-transform: uppercase; letter-spacing: .5px;
+    }
+    .risk-badge.green { background: #1a3d2f; color: #22c55e; }
+    .risk-badge.amber { background: #3d2c1a; color: #fbbf24; }
+    .risk-badge.red   { background: #3d1a1a; color: #f87171; }
+    .status-pill {
+      display: inline-block; padding: 2px 8px; border-radius: 20px;
+      font-size: .65rem; font-weight: 600;
+    }
+    .status-pill.on-track    { background: #1a3d2f; color: #86efac; }
+    .status-pill.in-progress { background: #1e3a5f; color: #60a5fa; }
+    .status-pill.at-risk     { background: #3d1a1a; color: #f87171; }
+    .status-pill.active      { background: #2d1a5f; color: #a78bfa; }
+    .exec-panel { background: #1a1d2e; border: 1px solid #2d3148; border-radius: 10px; padding: 16px; }
+    .project-table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+    .project-table th {
+      background: #0f1117; color: #64748b; padding: 10px 12px;
+      text-align: left; font-weight: 600; font-size: .68rem;
+      text-transform: uppercase; letter-spacing: .5px; border-bottom: 1px solid #2d3148;
+    }
+    .project-table td { padding: 11px 12px; border-bottom: 1px solid #1e2130; vertical-align: middle; }
+    .project-table tr:hover td { background: #1e2130; }
+    .project-table tr:last-child td { border-bottom: none; }
+    .progress-bar-wrap { display: flex; align-items: center; gap: 8px; }
+    .progress-bar { flex: 1; height: 6px; background: #2d3148; border-radius: 3px; overflow: hidden; }
+    .progress-bar-fill { height: 100%; border-radius: 3px; }
+    .progress-bar-fill.green { background: linear-gradient(90deg,#16a34a,#22c55e); }
+    .progress-bar-fill.amber { background: linear-gradient(90deg,#d97706,#fbbf24); }
+    .progress-bar-fill.red   { background: linear-gradient(90deg,#dc2626,#f87171); }
+    .progress-pct { font-size: .7rem; color: #94a3b8; min-width: 30px; text-align: right; }
+    .exec-metric {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 9px 0; border-bottom: 1px solid #1e2130; font-size: .8rem;
+    }
+    .exec-metric:last-child { border-bottom: none; }
+    .exec-metric .em-label { color: #94a3b8; font-size: .78rem; display: flex; align-items: center; gap: 8px; }
+    .exec-metric .em-value { font-weight: 700; color: #e2e8f0; }
+    .exec-metric .em-value.green { color: #22c55e; }
+    .exec-metric .em-value.amber { color: #fbbf24; }
+    .exec-metric .em-value.red   { color: #f87171; }
+    .approval-table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+    .approval-table th {
+      background: #0f1117; color: #64748b; padding: 10px 12px;
+      text-align: left; font-weight: 600; font-size: .68rem;
+      text-transform: uppercase; letter-spacing: .5px; border-bottom: 1px solid #2d3148;
+    }
+    .approval-table td { padding: 11px 12px; border-bottom: 1px solid #1e2130; vertical-align: middle; }
+    .approval-table tr:hover td { background: #1e2130; }
+    .approval-table tr:last-child td { border-bottom: none; }
+    .aging-badge {
+      display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: .68rem; font-weight: 700;
+    }
+    .aging-badge.fresh   { background: #1a3d2f; color: #22c55e; }
+    .aging-badge.warning { background: #3d2c1a; color: #fbbf24; }
+    .aging-badge.urgent  { background: #3d1a1a; color: #f87171; }
+    .spark-wrap { display: flex; align-items: flex-end; gap: 5px; height: 80px; padding: 0 4px; }
+    .spark-col  { display: flex; flex-direction: column; align-items: center; gap: 4px; flex: 1; }
+    .spark-bar  {
+      width: 100%; border-radius: 3px 3px 0 0;
+      background: linear-gradient(180deg,#7c6af7,#4f46e5); opacity: .75; transition: opacity .2s;
+    }
+    .spark-bar:hover { opacity: 1; }
+    .spark-lbl  { font-size: .6rem; color: #475569; white-space: nowrap; }
+    .spark-cnt  { font-size: .62rem; color: #94a3b8; }
   </style>
 </head>
 <body>
@@ -249,6 +318,9 @@
   <div class="nav-section">Library</div>
   <a onclick="showView('patterns')"    data-view="patterns">    <span class="icon">🔄</span> Patterns</a>
   <a onclick="showView('lessons')"     data-view="lessons">     <span class="icon">💡</span> Lessons</a>
+  <div class="nav-section">Executive</div>
+  <a onclick="showView('portfolio')"   data-view="portfolio">   <span class="icon">📁</span> Portfolio</a>
+  <a onclick="showView('approvals')"   data-view="approvals">   <span class="icon">✅</span> Approvals</a>
   <div class="nav-section">Finance</div>
   <a onclick="showView('costs')"       data-view="costs">       <span class="icon">💰</span> Costs</a>
 </nav>
@@ -306,6 +378,72 @@
     <div>
       <div class="section-title">💡 Lessons Learned</div>
       <div id="lessons-list"></div>
+    </div>
+  </div>
+
+  <!-- PORTFOLIO ────────────────────────────────────────────────── -->
+  <div class="view-block" id="view-portfolio">
+    <div>
+      <div class="section-title">📁 Portfolio Health <small id="hdr-portfolio"></small></div>
+      <div class="kpi-strip">
+        <div class="kpi green">  <div class="label">Portfolio Value</div>   <div class="value" id="pf-value">—</div>   <div class="sub">Total contracted</div></div>
+        <div class="kpi blue">  <div class="label">Deployed</div>           <div class="value" id="pf-spent">—</div>   <div class="sub">of portfolio value</div></div>
+        <div class="kpi purple"><div class="label">Projects On Track</div>  <div class="value" id="pf-ontrack">—</div> <div class="sub">vs total active</div></div>
+        <div class="kpi amber"> <div class="label">Pending Decisions</div>  <div class="value" id="pf-pending">—</div> <div class="sub">Awaiting approval</div></div>
+      </div>
+    </div>
+    <div>
+      <div class="section-title">📋 Project Status Register</div>
+      <div class="exec-panel">
+        <table class="project-table">
+          <thead>
+            <tr>
+              <th>Project</th><th>Phase</th><th>Owner</th>
+              <th>Risk</th><th>Budget</th><th>Spent</th><th>Progress</th><th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="project-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+      <div>
+        <div class="section-title">💰 Financial Summary</div>
+        <div class="exec-panel" id="fin-summary"></div>
+      </div>
+      <div>
+        <div class="section-title">⚠️ Active Risks &amp; Blockers</div>
+        <div class="exec-panel" id="risk-summary"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- APPROVALS ────────────────────────────────────────────────── -->
+  <div class="view-block" id="view-approvals">
+    <div>
+      <div class="section-title">✅ Approval Pipeline <small>Human-in-the-loop gates</small></div>
+      <div class="kpi-strip">
+        <div class="kpi amber"><div class="label">Pending Approvals</div>  <div class="value" id="ap-pending">—</div>  <div class="sub">Awaiting response</div></div>
+        <div class="kpi red">  <div class="label">Oldest Pending</div>     <div class="value" id="ap-oldest">—</div>   <div class="sub">Hours waiting</div></div>
+        <div class="kpi green"><div class="label">Avg Turnaround</div>     <div class="value" id="ap-avg">—</div>      <div class="sub">Hours · 7-day avg</div></div>
+        <div class="kpi blue"> <div class="label">Approved This Week</div> <div class="value" id="ap-week">—</div>     <div class="sub">Total decisions</div></div>
+      </div>
+    </div>
+    <div>
+      <div class="section-title">⏳ Pending Queue</div>
+      <div class="exec-panel">
+        <table class="approval-table">
+          <thead><tr><th>Project</th><th>Stage Gate</th><th>Agent</th><th>Waiting</th><th>Approver</th></tr></thead>
+          <tbody id="approval-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div>
+      <div class="section-title">📈 7-Day Approval Volume</div>
+      <div class="exec-panel">
+        <div class="spark-wrap" id="approval-spark"></div>
+        <div id="approval-trend-footer" style="margin-top:12px;font-size:.72rem;color:#64748b"></div>
+      </div>
     </div>
   </div>
 
@@ -393,6 +531,46 @@ let knowledgeData = {
     { agent_name:"QA Agent",      skill_name:"audit_deliverable",      skill_level:"NOVICE",       success_count:1, error_count:0, avg_execution_time:90.0   },
     { agent_name:"Manager Agent", skill_name:"portfolio_review",       skill_level:"NOVICE",       success_count:1, error_count:0, avg_execution_time:60.0   },
     { agent_name:"Vendor Agent",  skill_name:"sla_management",         skill_level:"NOVICE",       success_count:1, error_count:0, avg_execution_time:75.0   },
+  ]
+};
+
+// ============================================================================
+// EXECUTIVE MOCK DATA — Portfolio & Approvals
+// ============================================================================
+const PORTFOLIO = {
+  summary: {
+    total_value: 2750000, total_spent: 687500,
+    projects_on_track: 3, projects_total: 4,
+    projects_at_risk: 1, pending_approvals: 3, blocked_count: 1
+  },
+  projects: [
+    { name:"AURA MVP",          status:"On Track",    owner:"Kiera",   risk:"green", budget:150000,  spent:37500,  progress:25, phase:"Design"      },
+    { name:"Chevron Sand Mgmt", status:"In Progress", owner:"Elina",   risk:"amber", budget:800000,  spent:360000, progress:45, phase:"Development" },
+    { name:"WWT Enhancement",   status:"At Risk",     owner:"Ron",     risk:"red",   budget:200000,  spent:160000, progress:80, phase:"UAT"         },
+    { name:"Middle East",       status:"Active",      owner:"Partner", risk:"green", budget:1600000, spent:130000, progress:8,  phase:"Initiation"  },
+  ],
+  risks: [
+    { level:"red",   label:"WWT UAT delays — 80% budget used, deadline at risk",        owner:"Ron"     },
+    { level:"amber", label:"Chevron GPU resource constraint — blocking development",     owner:"Elina"   },
+    { level:"green", label:"AURA MVP on schedule — design phase progressing well",       owner:"Kiera"   },
+    { level:"green", label:"Middle East — partnership agreement in final review",        owner:"Partner" },
+  ]
+};
+
+const APPROVALS_DATA = {
+  queue: [
+    { project:"AURA MVP",         stage:"Charter Approval",    agent:"PM Agent", waiting_hours:2.3,  approver:"trice@firstgenesis.com" },
+    { project:"Chevron Sand Mgmt",stage:"Requirements Review", agent:"BA Agent", waiting_hours:4.1,  approver:"trice@firstgenesis.com" },
+    { project:"WWT Enhancement",  stage:"Delivery Approval",   agent:"QA Agent", waiting_hours:19.5, approver:"trice@firstgenesis.com" },
+  ],
+  history: [
+    { date:"Mar 11", count:4, avg_hours:1.9 },
+    { date:"Mar 12", count:3, avg_hours:2.8 },
+    { date:"Mar 13", count:6, avg_hours:1.2 },
+    { date:"Mar 14", count:2, avg_hours:3.2 },
+    { date:"Mar 15", count:5, avg_hours:1.5 },
+    { date:"Mar 16", count:3, avg_hours:2.1 },
+    { date:"Mar 17", count:4, avg_hours:1.8 },
   ]
 };
 
@@ -574,6 +752,108 @@ function renderCosts() {
     </div>`;
 }
 
+function renderPortfolio() {
+  const s = PORTFOLIO.summary;
+  const projects = PORTFOLIO.projects;
+
+  // KPIs
+  document.getElementById('pf-value').textContent   = '$' + (s.total_value / 1e6).toFixed(2) + 'M';
+  const pct = ((s.total_spent / s.total_value) * 100).toFixed(1);
+  document.getElementById('pf-spent').textContent   = '$' + (s.total_spent / 1e3).toFixed(0) + 'K (' + pct + '%)';
+  document.getElementById('pf-ontrack').textContent = s.projects_on_track + ' / ' + s.projects_total;
+  document.getElementById('pf-pending').textContent = s.pending_approvals;
+  document.getElementById('hdr-portfolio').textContent = '— Updated ' + fmtTime(new Date().toISOString());
+
+  // Project register table
+  const statusClass = { 'On Track':'on-track','In Progress':'in-progress','At Risk':'at-risk','Active':'active' };
+  document.getElementById('project-tbody').innerHTML = projects.map(p => {
+    const budgetPct = ((p.spent / p.budget) * 100).toFixed(0);
+    return `<tr>
+      <td style="font-weight:600;color:#e2e8f0">${p.name}</td>
+      <td style="color:#94a3b8;font-size:.75rem">${p.phase}</td>
+      <td style="color:#94a3b8">${p.owner}</td>
+      <td><span class="risk-badge ${p.risk}">${p.risk.toUpperCase()}</span></td>
+      <td style="color:#94a3b8">$${(p.budget/1e3).toFixed(0)}K</td>
+      <td style="color:#e2e8f0">$${(p.spent/1e3).toFixed(0)}K <span style="color:#64748b;font-size:.7rem">(${budgetPct}%)</span></td>
+      <td style="min-width:120px">
+        <div class="progress-bar-wrap">
+          <div class="progress-bar"><div class="progress-bar-fill ${p.risk}" style="width:${p.progress}%"></div></div>
+          <div class="progress-pct">${p.progress}%</div>
+        </div>
+      </td>
+      <td><span class="status-pill ${statusClass[p.status]||'active'}">${p.status}</span></td>
+    </tr>`;
+  }).join('');
+
+  // Financial summary
+  const totalBudget = projects.reduce((a,p)=>a+p.budget,0);
+  const totalSpent  = projects.reduce((a,p)=>a+p.spent,0);
+  const remaining   = totalBudget - totalSpent;
+  const burn        = ((totalSpent/totalBudget)*100).toFixed(1);
+  const burnColor   = burn > 80 ? 'red' : burn > 50 ? 'amber' : 'green';
+  document.getElementById('fin-summary').innerHTML = `
+    <div class="exec-metric"><span class="em-label">Total Portfolio Value</span>  <span class="em-value">$${(totalBudget/1e6).toFixed(2)}M</span></div>
+    <div class="exec-metric"><span class="em-label">Total Deployed</span>         <span class="em-value amber">$${(totalSpent/1e3).toFixed(0)}K</span></div>
+    <div class="exec-metric"><span class="em-label">Remaining Budget</span>       <span class="em-value green">$${(remaining/1e6).toFixed(2)}M</span></div>
+    <div class="exec-metric"><span class="em-label">Budget Burn Rate</span>       <span class="em-value ${burnColor}">${burn}%</span></div>
+    <div class="exec-metric"><span class="em-label">AI Agent Cost (daily)</span>  <span class="em-value green">$0.20</span></div>
+    <div class="exec-metric"><span class="em-label">Cost Headroom vs Budget</span><span class="em-value green">25×</span></div>`;
+
+  // Risks & blockers
+  document.getElementById('risk-summary').innerHTML = PORTFOLIO.risks.map(r => `
+    <div class="exec-metric">
+      <span class="em-label">
+        <span class="risk-badge ${r.level}">${r.level.toUpperCase()}</span>
+        ${r.label}
+      </span>
+      <span style="color:#475569;font-size:.7rem">${r.owner}</span>
+    </div>`).join('');
+}
+
+function renderApprovals() {
+  const queue = APPROVALS_DATA.queue;
+  const hist  = APPROVALS_DATA.history;
+
+  // KPIs
+  const oldest      = queue.length ? Math.max(...queue.map(a=>a.waiting_hours)) : 0;
+  const avgTurnaround = (hist.reduce((s,h)=>s+h.avg_hours,0)/hist.length).toFixed(1);
+  const weekTotal   = hist.reduce((s,h)=>s+h.count,0);
+  document.getElementById('ap-pending').textContent = queue.length;
+  document.getElementById('ap-oldest').textContent  = oldest.toFixed(1) + 'h';
+  document.getElementById('ap-avg').textContent     = avgTurnaround + 'h';
+  document.getElementById('ap-week').textContent    = weekTotal;
+
+  // Queue table
+  function agingClass(h) { return h < 4 ? 'fresh' : h < 12 ? 'warning' : 'urgent'; }
+  function agingLabel(h) { return h < 4 ? 'Fresh'  : h < 12 ? 'Aging'   : 'URGENT'; }
+  document.getElementById('approval-tbody').innerHTML = queue.length
+    ? queue.map(a => `
+        <tr>
+          <td style="font-weight:600;color:#e2e8f0">${a.project}</td>
+          <td style="color:#a78bfa">${a.stage}</td>
+          <td style="color:#94a3b8;font-size:.75rem">${a.agent}</td>
+          <td><span class="aging-badge ${agingClass(a.waiting_hours)}">${agingLabel(a.waiting_hours)} — ${a.waiting_hours.toFixed(1)}h</span></td>
+          <td style="color:#64748b;font-size:.72rem">${a.approver}</td>
+        </tr>`).join('')
+    : '<tr><td colspan="5" style="text-align:center;color:#475569;padding:20px">✅ No pending approvals</td></tr>';
+
+  // Sparkline — 7-day volume
+  const maxCount = Math.max(...hist.map(h=>h.count));
+  document.getElementById('approval-spark').innerHTML = hist.map(h => {
+    const barH = Math.round((h.count / maxCount) * 64);
+    return `<div class="spark-col">
+      <span class="spark-cnt">${h.count}</span>
+      <div class="spark-bar" style="height:${barH}px"></div>
+      <span class="spark-lbl">${h.date.replace('Mar ','M')}</span>
+    </div>`;
+  }).join('');
+
+  document.getElementById('approval-trend-footer').innerHTML =
+    `7-day total: <strong style="color:#e2e8f0">${weekTotal}</strong> approvals &nbsp;|&nbsp;
+     Avg turnaround: <strong style="color:#22c55e">${avgTurnaround}h</strong> &nbsp;|&nbsp;
+     On-time rate: <strong style="color:#a78bfa">94%</strong>`;
+}
+
 function renderAside() {
   // Patterns
   document.getElementById('aside-patterns-list').innerHTML =
@@ -626,12 +906,14 @@ function showAside(tab) {
 }
 
 function renderView(view) {
-  if (view === 'overview')  { renderOverview(); }
-  if (view === 'comms')     { renderCommLog('comm-log-full', [...state.recent_communications].reverse()); }
-  if (view === 'skills')    { renderSkills(); }
-  if (view === 'patterns')  { renderPatterns(); }
-  if (view === 'lessons')   { renderLessons(); }
-  if (view === 'costs')     { renderCosts(); }
+  if (view === 'overview')   { renderOverview(); }
+  if (view === 'comms')      { renderCommLog('comm-log-full', [...state.recent_communications].reverse()); }
+  if (view === 'skills')     { renderSkills(); }
+  if (view === 'patterns')   { renderPatterns(); }
+  if (view === 'lessons')    { renderLessons(); }
+  if (view === 'costs')      { renderCosts(); }
+  if (view === 'portfolio')  { renderPortfolio(); }
+  if (view === 'approvals')  { renderApprovals(); }
   renderAside();
 }
 
