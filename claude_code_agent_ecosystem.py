@@ -2025,7 +2025,9 @@ class StageGateManager:
         )
     }
 
-    def __init__(self, db: WorkflowDatabase, email_gateway: EmailGateway):
+    def __init__(self, db: WorkflowDatabase, email_gateway):
+        # email_gateway accepts EmailGateway or NotificationRouter (duck-typed:
+        # both expose send_approval_request() with the same signature)
         self.db = db
         self.email = email_gateway
 
@@ -2259,12 +2261,33 @@ class AutonomousAgentWithEmailGates:
     def __init__(self, api_key: Optional[str] = None):
         self.client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
         self.db = WorkflowDatabase()
-        self.email_gateway = EmailGateway()
-        self.stage_gate_manager = StageGateManager(self.db, self.email_gateway)
         self.budget_enforcer = BudgetEnforcer(self.db)
         self.hallucination_guard = HallucinationGuard(self.db)
 
-        # Knowledge injector — loads knowledge/ folder + DB lessons at call time
+        # ── Notification router (Slack + Telegram + WhatsApp + Email + HubSpot) ──
+        email_gw = EmailGateway()
+        try:
+            from fg_integrations.notification_router import NotificationRouter
+            from fg_integrations.slack_gateway import SlackGateway
+            from fg_integrations.telegram_gateway import TelegramGateway
+            from fg_integrations.whatsapp_gateway import WhatsAppGateway
+            from fg_integrations.hubspot_sync import HubSpotSync
+
+            slack_gw     = SlackGateway()    if os.environ.get("SLACK_BOT_TOKEN")      else None
+            telegram_gw  = TelegramGateway() if os.environ.get("TELEGRAM_BOT_TOKEN")   else None
+            whatsapp_gw  = WhatsAppGateway() if os.environ.get("WHATSAPP_PROVIDER")    else None
+            hubspot_sync = HubSpotSync()     if os.environ.get("HUBSPOT_ACCESS_TOKEN") else None
+
+            self.router = NotificationRouter(email_gw, slack_gw, telegram_gw, whatsapp_gw, hubspot_sync)
+            logger.info(f"NotificationRouter active channels: {self.router.active_channels()}")
+        except ImportError:
+            # fg_integrations not installed — fall back to email-only router shim
+            self.router = email_gw
+            logger.info("NotificationRouter not available — using email-only gateway")
+
+        self.stage_gate_manager = StageGateManager(self.db, self.router)
+
+        # ── Knowledge injector ────────────────────────────────────────────────
         try:
             from fg_knowledge_injector import KnowledgeInjector
             self.knowledge_injector = KnowledgeInjector()
@@ -2701,6 +2724,20 @@ Provide executive summary with all projects at a glance, budget summary, top ris
         workflow_state.next_step_after_approval = next_action
         self.db.save_workflow_state(workflow_state)
         logger.info(f"Agent proceeding: {next_action}")
+
+        # HubSpot CRM sync — notify on completion or gate advancement
+        if hasattr(self, "router") and hasattr(self.router, "notify_hubspot_on_gate_approval"):
+            gate_name = workflow_state.current_stage_gate.value
+            if is_final:
+                self.router.notify_hubspot_on_completion(
+                    workflow_id, workflow_state.project_name, workflow_state.agent_name
+                )
+            else:
+                self.router.notify_hubspot_on_gate_approval(
+                    workflow_id, workflow_state.project_name, workflow_state.agent_name,
+                    gate_name, "approved"
+                )
+
         return next_action
 
     def check_pending_approvals(self) -> str:

@@ -837,6 +837,186 @@ setInterval(load, 10000);
 # ============================================================================
 # MAIN
 # ============================================================================
+# ============================================================================
+# INBOUND WEBHOOKS — Slack, Telegram, WhatsApp approval replies
+# ============================================================================
+# Shared WorkflowDatabase for recording approval responses from all channels
+try:
+    from claude_code_agent_ecosystem import (
+        WorkflowDatabase as _WDB,
+        StageGateManager as _SGM,
+        EmailGateway as _EGW,
+    )
+    _workflow_db = _WDB()
+    _sgm = _SGM(_workflow_db, _EGW())
+    _WEBHOOKS_AVAILABLE = True
+except ImportError:
+    _workflow_db = None
+    _sgm = None
+    _WEBHOOKS_AVAILABLE = False
+
+
+def _record_approval(workflow_id, approver_email, decision, feedback=""):
+    """Helper: record approval and return JSON response."""
+    if not _WEBHOOKS_AVAILABLE or not workflow_id or not decision:
+        return {"status": "error", "error": "invalid payload or ecosystem unavailable"}, 400
+    try:
+        state = _sgm.record_approval_response(workflow_id, approver_email, decision, feedback)
+        return {"status": "ok", "workflow_id": workflow_id, "decision": state.status.value}, 200
+    except Exception as exc:
+        app.logger.error(f"Approval recording failed: {exc}")
+        return {"status": "error", "error": str(exc)}, 500
+
+
+# ── Slack webhook ─────────────────────────────────────────────────────────────
+@app.route("/webhooks/slack", methods=["POST"])
+def webhook_slack():
+    """
+    Handle Slack slash commands and interactive Block Kit button clicks.
+
+    Slash command: /fg-approve {workflow_id} approved|rejected [feedback]
+    Interactive:   button payload with action_id fg_approve or fg_reject
+    """
+    try:
+        from fg_integrations.slack_gateway import SlackGateway
+        slack_gw = SlackGateway()
+
+        # Signature verification
+        timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
+        signature = request.headers.get("X-Slack-Signature", "")
+        if not slack_gw.verify_signature(request.get_data(), timestamp, signature):
+            return {"error": "invalid signature"}, 403
+
+        content_type = request.content_type or ""
+        if "application/x-www-form-urlencoded" in content_type:
+            form = request.form.to_dict()
+
+            # Interactive payload (button click)
+            if "payload" in form:
+                import json as _json
+                workflow_id, decision, feedback = slack_gw.parse_interactive(form["payload"])
+                payload = _json.loads(form["payload"])
+                slack_uid = payload.get("user", {}).get("id", "")
+                approver_email = slack_gw.get_approver_email_from_slack_id(slack_uid) or slack_uid
+
+            # Slash command
+            elif "command" in form:
+                workflow_id, decision, feedback = slack_gw.parse_slash_command(form)
+                slack_uid = form.get("user_id", "")
+                approver_email = slack_gw.get_approver_email_from_slack_id(slack_uid) or slack_uid
+            else:
+                return {"error": "unrecognised Slack payload"}, 400
+
+            data, code = _record_approval(workflow_id, approver_email, decision, feedback)
+            if code == 200:
+                response_channel = form.get("channel_id") or form.get("user_id") or ""
+                if response_channel:
+                    slack_gw.send_confirmation(response_channel, workflow_id, decision)
+            return jsonify(data), code
+
+    except ImportError:
+        app.logger.warning("SlackGateway not available — install fg_integrations")
+        return {"error": "Slack integration not configured"}, 503
+    except Exception as exc:
+        app.logger.error(f"Slack webhook error: {exc}")
+        return {"error": str(exc)}, 500
+
+
+# ── Telegram webhook ──────────────────────────────────────────────────────────
+@app.route("/webhooks/telegram", methods=["POST"])
+def webhook_telegram():
+    """
+    Handle Telegram bot updates.
+
+    /approve {workflow_id} [feedback]
+    /reject  {workflow_id} [feedback]
+    """
+    try:
+        from fg_integrations.telegram_gateway import TelegramGateway
+        tg_gw = TelegramGateway()
+
+        # Optional secret token validation
+        secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not tg_gw.verify_secret(secret):
+            return {"error": "invalid secret"}, 403
+
+        update = request.get_json(force=True) or {}
+        chat_id, workflow_id, decision, feedback = tg_gw.parse_update(update)
+        approver_email = tg_gw.get_approver_email_from_chat_id(chat_id) or chat_id
+
+        data, code = _record_approval(workflow_id, approver_email, decision, feedback)
+        if code == 200 and chat_id:
+            tg_gw.send_confirmation(chat_id, workflow_id, decision)
+        return jsonify(data), code
+
+    except ImportError:
+        app.logger.warning("TelegramGateway not available — install fg_integrations")
+        return {"error": "Telegram integration not configured"}, 503
+    except Exception as exc:
+        app.logger.error(f"Telegram webhook error: {exc}")
+        return {"error": str(exc)}, 500
+
+
+# ── WhatsApp webhook ──────────────────────────────────────────────────────────
+@app.route("/webhooks/whatsapp", methods=["GET", "POST"])
+def webhook_whatsapp():
+    """
+    Handle WhatsApp inbound messages (Twilio or Meta).
+
+    Approver replies: "APPROVED {workflow_id} [feedback]"
+                  or "REJECTED {workflow_id} [feedback]"
+
+    GET: Meta webhook verification challenge.
+    POST: Inbound message (Twilio form-encoded or Meta JSON).
+    """
+    try:
+        from fg_integrations.whatsapp_gateway import WhatsAppGateway
+        wa_gw = WhatsAppGateway()
+
+        # Meta webhook GET verification
+        if request.method == "GET":
+            mode      = request.args.get("hub.mode", "")
+            token     = request.args.get("hub.verify_token", "")
+            challenge = request.args.get("hub.challenge", "")
+            result = wa_gw.verify_meta_webhook(mode, token, challenge)
+            if result:
+                return result, 200
+            return "Forbidden", 403
+
+        # POST — inbound message
+        provider = wa_gw.provider
+        if provider == "twilio":
+            form = request.form.to_dict()
+            # Optional Twilio signature verification
+            sig = request.headers.get("X-Twilio-Signature", "")
+            wa_gw.verify_twilio_signature(request.url, form, sig)
+
+            phone, workflow_id, decision, feedback = wa_gw.parse_twilio_inbound(form)
+        else:
+            payload = request.get_json(force=True) or {}
+            phone, workflow_id, decision, feedback = wa_gw.parse_meta_inbound(payload)
+
+        approver_email = wa_gw.get_approver_email_from_phone(phone) if phone else phone
+        data, code = _record_approval(workflow_id, approver_email or phone, decision, feedback)
+        if code == 200 and phone:
+            wa_gw.send_confirmation(phone, workflow_id, decision)
+
+        # Twilio expects 200 + TwiML even for no-reply (return empty TwiML)
+        if provider == "twilio":
+            return '<?xml version="1.0"?><Response></Response>', 200, {"Content-Type": "text/xml"}
+        return jsonify(data), code
+
+    except ImportError:
+        app.logger.warning("WhatsAppGateway not available — install fg_integrations")
+        return {"error": "WhatsApp integration not configured"}, 503
+    except Exception as exc:
+        app.logger.error(f"WhatsApp webhook error: {exc}")
+        return {"error": str(exc)}, 500
+
+
+# ============================================================================
+# SERVER START
+# ============================================================================
 def init_db_and_start():
     with app.app_context():
         db.create_all()
@@ -847,6 +1027,9 @@ def init_db_and_start():
 ║   First Genesis — Agent Command Center Server                  ║
 ╠════════════════════════════════════════════════════════════════╣
 ║  ✅ WebSocket Real-Time Updates   (every 3 seconds)            ║
+║  📲 Slack webhook:    POST /webhooks/slack                      ║
+║  📲 Telegram webhook: POST /webhooks/telegram                  ║
+║  📲 WhatsApp webhook: POST /webhooks/whatsapp                  ║
 ║  ✅ REST API Endpoints            (15+ routes)                 ║
 ║  ✅ Alert System                  (error rate / budget)        ║
 ║  ✅ Metrics Export                (CSV, PDF, email)            ║
