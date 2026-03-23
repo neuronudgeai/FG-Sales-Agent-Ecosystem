@@ -43,6 +43,24 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from enum import Enum
 
+# ── Governance layer (sales agent gated workflow) ─────────────────────────────
+# Import the new governance modules so they are available to any code that
+# imports this module, and so the CLI can dispatch to the sales pipeline.
+try:
+    from fg_audit_logger import AuditLogger as FGAuditLogger
+    from fg_token_budget import TokenBudget as FGTokenBudget
+    from fg_review_gate import ReviewGate as FGReviewGate
+    from fg_sales_agents import (
+        LeadQualifierAgent,
+        AccountManagerAgent,
+        ForecastAgent,
+        CompetitorIntelAgent,
+    )
+    from fg_gated_orchestrator import GatedOrchestrator
+    _GOVERNANCE_AVAILABLE = True
+except ImportError:
+    _GOVERNANCE_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -3261,6 +3279,47 @@ def main():
                 print(f"  Reason:  {reason}")
                 if snippet:
                     print(f"  Snippet: {snippet[:80]}...")
+
+    # ── Sales pipeline governance commands ───────────────────────────────────
+    elif command == "sales_qualify":
+        if not _GOVERNANCE_AVAILABLE:
+            print("ERROR: governance modules not found. Run from project root.")
+            sys.exit(1)
+        from fg_gated_orchestrator import GatedOrchestrator, DEMO_LEAD
+        orch = GatedOrchestrator()
+        orch.run_lead_qualifier(DEMO_LEAD)
+
+    elif command == "sales_pipeline":
+        if not _GOVERNANCE_AVAILABLE:
+            print("ERROR: governance modules not found. Run from project root.")
+            sys.exit(1)
+        from fg_gated_orchestrator import GatedOrchestrator, DEMO_LEAD, DEMO_PIPELINE
+        auto = "--auto-approve" in sys.argv
+        orch = GatedOrchestrator()
+        orch.run_full_sales_pipeline(DEMO_LEAD, DEMO_PIPELINE, auto_approve_for_demo=auto)
+
+    elif command == "sales_pending":
+        if not _GOVERNANCE_AVAILABLE:
+            print("ERROR: governance modules not found. Run from project root.")
+            sys.exit(1)
+        from fg_gated_orchestrator import GatedOrchestrator
+        GatedOrchestrator().list_pending_reviews()
+
+    elif command == "sales_budget":
+        if not _GOVERNANCE_AVAILABLE:
+            print("ERROR: governance modules not found. Run from project root.")
+            sys.exit(1)
+        from fg_gated_orchestrator import GatedOrchestrator
+        GatedOrchestrator().print_budget_status()
+
+    elif command == "sales_stats":
+        if not _GOVERNANCE_AVAILABLE:
+            print("ERROR: governance modules not found. Run from project root.")
+            sys.exit(1)
+        from fg_gated_orchestrator import GatedOrchestrator
+        orch = GatedOrchestrator()
+        orch.print_approval_stats()
+        orch.print_daily_cost()
 
     else:
         print(f"Unknown command: {command}")
