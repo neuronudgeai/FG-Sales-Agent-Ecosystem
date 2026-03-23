@@ -69,6 +69,7 @@ MVP_ACTIVE_AGENTS: frozenset = frozenset({
     "ba_agent",
     "qa_agent",
     "vendor_agent",
+    "manager_agent",
 })
 
 class AgentIdleError(RuntimeError):

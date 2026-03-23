@@ -34,7 +34,7 @@ _DEFAULT_DB_PATH = os.environ.get(
 )
 
 # Agents that have a dedicated sub-folder in knowledge/
-_KNOWN_AGENTS = {"pm_agent", "ba_agent", "qa_agent", "vendor_agent"}
+_KNOWN_AGENTS = {"pm_agent", "ba_agent", "qa_agent", "vendor_agent", "manager_agent"}
 
 # How many DB lessons to inject per call (keeps context window lean)
 _MAX_DB_LESSONS = 3
