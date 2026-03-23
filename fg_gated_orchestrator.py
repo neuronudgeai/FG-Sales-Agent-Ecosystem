@@ -610,7 +610,7 @@ def main() -> None:
     elif cmd == "daily_cost":
         orchestrator.print_daily_cost()
 
-    # ── Legacy agent commands ──────────────────────────────────────────────────
+    # ── Legacy agent commands (MVP: pm, ba, qa, vendor) ───────────────────────
     elif cmd == "pm_agent":
         orchestrator.run_pm_agent()
 
@@ -627,8 +627,11 @@ def main() -> None:
         vendor = args[1] if len(args) > 1 else "Yubi"
         orchestrator.run_vendor_agent(vendor_name=vendor)
 
-    elif cmd == "manager_agent":
-        orchestrator.run_manager_agent()
+    # ── IDLE agents (non-MVP) ──────────────────────────────────────────────────
+    elif cmd in ("manager_agent", "qualify_lead", "full_pipeline", "account_analysis", "competitor_analysis"):
+        print(f"\n⏸  '{cmd}' is IDLE for MVP.")
+        print("   Active agents: pm_agent, ba_agent, qa_agent, vendor_agent")
+        print("   To enable: add the agent to MVP_ACTIVE_AGENTS in claude_code_agent_ecosystem.py")
 
     else:
         print(f"Unknown command: {cmd}")

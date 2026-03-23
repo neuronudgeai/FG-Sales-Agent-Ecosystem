@@ -61,6 +61,19 @@ try:
 except ImportError:
     _GOVERNANCE_AVAILABLE = False
 
+# ── MVP agent roster ──────────────────────────────────────────────────────────
+# Only these agents are active for MVP.  All others are IDLE and will raise
+# AgentIdleError if invoked — preventing accidental spend or incomplete output.
+MVP_ACTIVE_AGENTS: frozenset = frozenset({
+    "pm_agent",
+    "ba_agent",
+    "qa_agent",
+    "vendor_agent",
+})
+
+class AgentIdleError(RuntimeError):
+    """Raised when a non-MVP agent is called while in IDLE mode."""
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -2255,6 +2268,14 @@ class AutonomousAgentWithEmailGates:
                      user_message: str, workflow_id: str = None) -> Tuple[str, AgentCall]:
         """Call Claude with budget check and hallucination validation."""
 
+        # MVP idle guard — block non-MVP agents before any API spend
+        if agent_name not in MVP_ACTIVE_AGENTS:
+            raise AgentIdleError(
+                f"Agent '{agent_name}' is IDLE for MVP. "
+                f"Active agents: {sorted(MVP_ACTIVE_AGENTS)}. "
+                "Add the agent to MVP_ACTIVE_AGENTS to enable it."
+            )
+
         # Estimate cost
         estimated_tokens = len(user_message.split()) * 1.3
         estimated_cost = (estimated_tokens / 1_000_000) * TokenCost.INPUT_COST_PER_1M
@@ -3596,28 +3617,15 @@ def main():
         print(f"   Output preview: {output[:200]}…")
 
     elif command == "run_manager_agent":
-        output, wf = agent.run_manager_agent_with_gates()
-        print(f"\n✅ Manager Agent complete. Workflow: {wf.workflow_id}")
-        print(f"   Status: {wf.status.value}")
-        print(f"   Output preview: {output[:200]}…")
+        print("\n⏸  Manager Agent is IDLE for MVP.")
+        print("   Active agents: pm_agent, ba_agent, qa_agent, vendor_agent")
+        print("   To enable: add 'manager_agent' to MVP_ACTIVE_AGENTS in this file.")
 
-    # ── Sales pipeline governance commands ───────────────────────────────────
-    elif command == "sales_qualify":
-        if not _GOVERNANCE_AVAILABLE:
-            print("ERROR: governance modules not found. Run from project root.")
-            sys.exit(1)
-        from fg_gated_orchestrator import GatedOrchestrator, DEMO_LEAD
-        orch = GatedOrchestrator()
-        orch.run_lead_qualifier(DEMO_LEAD)
-
-    elif command == "sales_pipeline":
-        if not _GOVERNANCE_AVAILABLE:
-            print("ERROR: governance modules not found. Run from project root.")
-            sys.exit(1)
-        from fg_gated_orchestrator import GatedOrchestrator, DEMO_LEAD, DEMO_PIPELINE
-        auto = "--auto-approve" in sys.argv
-        orch = GatedOrchestrator()
-        orch.run_full_sales_pipeline(DEMO_LEAD, DEMO_PIPELINE, auto_approve_for_demo=auto)
+    # ── Sales pipeline governance commands (IDLE for MVP) ────────────────────
+    elif command in ("sales_qualify", "sales_pipeline"):
+        print(f"\n⏸  Sales agents are IDLE for MVP (command: {command}).")
+        print("   Active agents: pm_agent, ba_agent, qa_agent, vendor_agent")
+        print("   To enable: add the relevant agent to MVP_ACTIVE_AGENTS in this file.")
 
     elif command == "sales_pending":
         if not _GOVERNANCE_AVAILABLE:
@@ -3641,6 +3649,14 @@ def main():
         orch = GatedOrchestrator()
         orch.print_approval_stats()
         orch.print_daily_cost()
+
+    # ── IDLE agents (non-MVP) ─────────────────────────────────────────────────
+    elif command in (
+        "sales_account", "sales_competitor", "sales_forecast",
+    ):
+        print(f"\n⏸  '{command}' agent is IDLE for MVP.")
+        print("   Active agents: pm_agent, ba_agent, qa_agent, vendor_agent")
+        print("   To enable: add the relevant agent to MVP_ACTIVE_AGENTS in this file.")
 
     else:
         print(f"Unknown command: {command}")
