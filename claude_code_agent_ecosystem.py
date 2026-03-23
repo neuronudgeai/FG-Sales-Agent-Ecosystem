@@ -2262,7 +2262,15 @@ class AutonomousAgentWithEmailGates:
         self.stage_gate_manager = StageGateManager(self.db, self.email_gateway)
         self.budget_enforcer = BudgetEnforcer(self.db)
         self.hallucination_guard = HallucinationGuard(self.db)
-        logger.info("Agent system initialized")
+
+        # Knowledge injector — loads knowledge/ folder + DB lessons at call time
+        try:
+            from fg_knowledge_injector import KnowledgeInjector
+            self.knowledge_injector = KnowledgeInjector()
+            logger.info("Agent system initialized with knowledge injector")
+        except ImportError:
+            self.knowledge_injector = None
+            logger.info("Agent system initialized (knowledge injector not available)")
 
     def _call_claude(self, agent_name: str, system_prompt: str,
                      user_message: str, workflow_id: str = None) -> Tuple[str, AgentCall]:
@@ -2437,9 +2445,23 @@ class AutonomousAgentWithEmailGates:
         """
         Full governed Claude call: _call_claude → AgentDecision → ReviewGate.
 
+        Knowledge context from knowledge/ folder + DB lessons is prepended to
+        the system_prompt automatically so every agent benefits from accumulated
+        best practices without any per-agent changes.
+
         Returns (raw_output, call, decision_or_None, gate_status, review_or_None).
         Falls back gracefully if governance modules are unavailable.
         """
+        # ── Knowledge injection ────────────────────────────────────────────────
+        if self.knowledge_injector is not None:
+            knowledge_ctx = self.knowledge_injector.get_context(agent_name)
+            if knowledge_ctx:
+                system_prompt = f"{knowledge_ctx}\n\n---\n\n{system_prompt}"
+                logger.debug(
+                    f"{agent_name}: knowledge context injected "
+                    f"(~{len(knowledge_ctx)//4} tokens)"
+                )
+
         output, call = self._call_claude(agent_name, system_prompt, user_message, workflow_id)
 
         if not output or not _GOVERNANCE_AVAILABLE:
