@@ -2326,21 +2326,137 @@ class AutonomousAgentWithEmailGates:
         logger.info(f"{agent_name}: Success - {call}")
         return output, call
 
+    # ── Governance layer helpers ──────────────────────────────────────────────
+
+    def _wrap_as_decision(
+        self,
+        raw_text: str,
+        call: "AgentCall",
+        agent_name: str,
+        workflow_id: str,
+        sensitivity_flag: bool = False,
+        data_sources: Optional[List[str]] = None,
+    ):
+        """
+        Convert a raw Claude output + AgentCall into an AgentDecision and log it
+        to the unified AuditLogger and TokenBudget.
+
+        Returns an AgentDecision if the governance modules are available,
+        otherwise returns None silently (backwards-compatible).
+        """
+        if not _GOVERNANCE_AVAILABLE:
+            return None
+
+        try:
+            cleaned = raw_text.strip()
+            if cleaned.startswith("```"):
+                cleaned = "\n".join(cleaned.split("\n")[1:])
+            if cleaned.endswith("```"):
+                cleaned = "\n".join(cleaned.split("\n")[:-1])
+
+            parsed = json.loads(cleaned)
+            recommendation = str(parsed.get("recommendation", raw_text[:200]))
+            confidence = float(parsed.get("confidence_score", 0.80))
+            confidence = max(0.0, min(1.0, confidence))
+            reasoning = parsed.get("reasoning", [])
+            assumptions = parsed.get("assumptions", [])
+            if isinstance(reasoning, str):
+                reasoning = [reasoning]
+            if isinstance(assumptions, str):
+                assumptions = [assumptions]
+        except (json.JSONDecodeError, ValueError):
+            recommendation = raw_text[:400]
+            confidence = 0.72
+            reasoning = ["Agent returned unstructured output — review recommended."]
+            assumptions = ["Output not in JSON format; structured fields may be missing."]
+
+        from fg_decision_models import AgentDecision as FGAgentDecision
+        decision = FGAgentDecision(
+            agent_name=agent_name,
+            workflow_id=workflow_id,
+            recommendation=recommendation,
+            confidence_score=confidence,
+            reasoning=reasoning,
+            data_sources=data_sources or [],
+            assumptions=assumptions,
+            requires_review=sensitivity_flag or confidence < 0.80,
+            sensitivity_flag=sensitivity_flag,
+            tokens_used=call.input_tokens + call.output_tokens,
+            model_version="claude-opus-4-6",
+            input_data={},
+        )
+
+        # Log to unified audit trail and token budget
+        _audit = FGAuditLogger()
+        _audit.log_decision(decision)
+        _audit.log_cost(
+            decision.decision_id, agent_name,
+            call.input_tokens, call.output_tokens,
+            "claude-opus-4-6", call.cost_usd,
+        )
+
+        _budget = FGTokenBudget()
+        _budget.log_usage(
+            agent_name, call.input_tokens, call.output_tokens,
+            "claude-opus-4-6", decision_id=decision.decision_id,
+            workflow_id=workflow_id,
+        )
+
+        return decision
+
+    def _governed_call(
+        self,
+        agent_name: str,
+        system_prompt: str,
+        user_message: str,
+        workflow_id: str,
+        sensitivity_flag: bool = False,
+        data_sources: Optional[List[str]] = None,
+    ) -> Tuple:
+        """
+        Full governed Claude call: _call_claude → AgentDecision → ReviewGate.
+
+        Returns (raw_output, call, decision_or_None, gate_status, review_or_None).
+        Falls back gracefully if governance modules are unavailable.
+        """
+        output, call = self._call_claude(agent_name, system_prompt, user_message, workflow_id)
+
+        if not output or not _GOVERNANCE_AVAILABLE:
+            return output, call, None, None, None
+
+        decision = self._wrap_as_decision(
+            output, call, agent_name, workflow_id, sensitivity_flag, data_sources
+        )
+
+        gate = FGReviewGate(audit_logger=FGAuditLogger())
+        gate_status, review = gate.evaluate(decision)
+        logger.info(f"{agent_name}: ReviewGate → {gate_status} (conf={decision.confidence_score:.0%})")
+
+        return output, call, decision, gate_status, review
+
+    # ── Agent run methods ─────────────────────────────────────────────────────
+
     def run_pm_agent_with_gates(self, project_metadata: dict) -> Tuple[str, WorkflowState]:
-        """Run PM Agent with guardrails + charter approval gate."""
+        """Run PM Agent with guardrails + charter approval gate + governance layer."""
 
         workflow_id = f"pm_{project_metadata['project']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         project_name = project_metadata.get('project', 'Unknown')
         logger.info(f"Starting PM Agent workflow: {workflow_id}")
 
-        output, call = self._call_claude(
+        output, call, decision, gate_status, review = self._governed_call(
             agent_name="pm_agent",
-            system_prompt="You are a Project Manager Agent for First Genesis. Output ONLY valid JSON. NO explanations, NO preamble.",
+            system_prompt=(
+                "You are a Project Manager Agent for First Genesis. "
+                "Output ONLY valid JSON with keys: recommendation, confidence_score (0-1), "
+                "reasoning (list), assumptions (list), project_charter, wbs, risks."
+            ),
             user_message=f"""Generate project charter for:
 {json.dumps(project_metadata, indent=2)}
 Output as JSON only:
-{{"project_charter": {{"title": "...", "client": "...", "timeline": "3 months"}}, "wbs": {{}}, "risks": []}}""",
-            workflow_id=workflow_id
+{{"recommendation": "Charter ready for approval", "confidence_score": 0.90, "reasoning": [], "assumptions": [], "project_charter": {{"title": "...", "client": "...", "timeline": "3 months"}}, "wbs": {{}}, "risks": []}}""",
+            workflow_id=workflow_id,
+            sensitivity_flag=True,
+            data_sources=["Project metadata", "First Genesis templates", "Client brief"],
         )
 
         if not output:
@@ -2349,6 +2465,167 @@ Output as JSON only:
         workflow_state = self.stage_gate_manager.pause_at_gate(
             workflow_id=workflow_id, agent_name="pm_agent", project_name=project_name,
             stage_gate_name=StageGateName.CHARTER_APPROVAL,
+            content_pending_approval=output
+        )
+        logger.info(f"Workflow {workflow_id} paused at {workflow_state.current_stage_gate.value}")
+        return output, workflow_state
+
+    def run_ba_agent_with_gates(self, project_name: str, transcript: str) -> Tuple[str, WorkflowState]:
+        """Run BA Agent with guardrails + requirements approval gate + governance layer."""
+
+        workflow_id = f"ba_{project_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        logger.info(f"Starting BA Agent workflow: {workflow_id}")
+
+        output, call, decision, gate_status, review = self._governed_call(
+            agent_name="ba_agent",
+            system_prompt=(
+                "You are a Business Analyst Agent for First Genesis. "
+                "Extract structured requirements from design session transcripts. "
+                "Output ONLY valid JSON with keys: recommendation, confidence_score (0-1), "
+                "reasoning (list), assumptions (list), functional_requirements (list), "
+                "non_functional_requirements (list), traceability_matrix (object)."
+            ),
+            user_message=f"""Extract requirements from this design session transcript for project: {project_name}
+
+TRANSCRIPT:
+{transcript}
+
+Output as JSON only with functional requirements (FR1, FR2...), non-functional requirements (NFR1...), and traceability matrix.""",
+            workflow_id=workflow_id,
+            sensitivity_flag=True,
+            data_sources=["Design session transcript", "Stakeholder notes", "Project charter"],
+        )
+
+        if not output:
+            raise RuntimeError(f"BA Agent call failed: {call.reason}")
+
+        workflow_state = self.stage_gate_manager.pause_at_gate(
+            workflow_id=workflow_id, agent_name="ba_agent", project_name=project_name,
+            stage_gate_name=StageGateName.REQUIREMENTS_APPROVAL,
+            content_pending_approval=output
+        )
+        logger.info(f"Workflow {workflow_id} paused at {workflow_state.current_stage_gate.value}")
+        return output, workflow_state
+
+    def run_qa_agent_with_gates(self, workflow_id_to_audit: str, project_name: str = "Unknown") -> Tuple[str, WorkflowState]:
+        """Run QA Agent pre-delivery audit + governance layer."""
+
+        workflow_id = f"qa_{project_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        logger.info(f"Starting QA Agent workflow: {workflow_id}")
+
+        # Retrieve content to audit from the source workflow
+        source_workflow = self.db.get_workflow_state(workflow_id_to_audit)
+        content_to_audit = source_workflow.content_pending_approval if source_workflow else f"Audit workflow: {workflow_id_to_audit}"
+
+        output, call, decision, gate_status, review = self._governed_call(
+            agent_name="qa_agent",
+            system_prompt=(
+                "You are a QA Agent for First Genesis. "
+                "Audit deliverables for completeness, scope creep, and readiness. "
+                "Output ONLY valid JSON with keys: recommendation, confidence_score (0-1), "
+                "reasoning (list), assumptions (list), checklist (list of pass/fail/warn items), "
+                "scope_creep_detected (bool), readiness (READY|NEEDS_WORK), quality_score (0-100)."
+            ),
+            user_message=f"""Audit these deliverables for project: {project_name}
+
+CONTENT TO AUDIT:
+{content_to_audit[:3000]}
+
+Check: all required deliverables present, no scope creep vs original RFP, all acceptance criteria met, ready for customer delivery.""",
+            workflow_id=workflow_id,
+            sensitivity_flag=False,
+            data_sources=["Workflow deliverables", "Original project scope", "Acceptance criteria"],
+        )
+
+        if not output:
+            raise RuntimeError(f"QA Agent call failed: {call.reason}")
+
+        workflow_state = self.stage_gate_manager.pause_at_gate(
+            workflow_id=workflow_id, agent_name="qa_agent", project_name=project_name,
+            stage_gate_name=StageGateName.QA_AUDIT_APPROVAL,
+            content_pending_approval=output
+        )
+        logger.info(f"Workflow {workflow_id} paused at {workflow_state.current_stage_gate.value}")
+        return output, workflow_state
+
+    def run_vendor_agent_with_gates(self, vendor_name: str, metrics: dict) -> Tuple[str, WorkflowState]:
+        """Run Vendor Agent SLA scorecard + governance layer."""
+
+        workflow_id = f"vendor_{vendor_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        logger.info(f"Starting Vendor Agent workflow: {workflow_id}")
+
+        output, call, decision, gate_status, review = self._governed_call(
+            agent_name="vendor_agent",
+            system_prompt=(
+                "You are a Vendor Management Agent for First Genesis. "
+                "Evaluate vendor SLA performance and generate scorecards. "
+                "Output ONLY valid JSON with keys: recommendation, confidence_score (0-1), "
+                "reasoning (list), assumptions (list), overall_score (0-100), "
+                "sla_status (PASS|FAIL), metrics_breakdown (object), escalation_required (bool), "
+                "action_items (list)."
+            ),
+            user_message=f"""Generate vendor performance scorecard for: {vendor_name}
+
+METRICS:
+{json.dumps(metrics, indent=2)}
+
+SLA Targets: on_time_delivery >= 95%, quality_score >= 90%, response_time_hours <= 24, budget_variance_pct <= 5%.
+Assess performance, flag any SLA breaches, and recommend actions.""",
+            workflow_id=workflow_id,
+            sensitivity_flag=False,
+            data_sources=["Vendor SLA contract", "Weekly status updates", "Cost actuals"],
+        )
+
+        if not output:
+            raise RuntimeError(f"Vendor Agent call failed: {call.reason}")
+
+        workflow_state = self.stage_gate_manager.pause_at_gate(
+            workflow_id=workflow_id, agent_name="vendor_agent", project_name=vendor_name,
+            stage_gate_name=StageGateName.DELIVERY_APPROVAL,
+            content_pending_approval=output
+        )
+        logger.info(f"Workflow {workflow_id} paused at {workflow_state.current_stage_gate.value}")
+        return output, workflow_state
+
+    def run_manager_agent_with_gates(self, portfolio_data: Optional[dict] = None) -> Tuple[str, WorkflowState]:
+        """Run Manager Agent portfolio dashboard + governance layer."""
+
+        workflow_id = f"manager_portfolio_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        project_name = "Portfolio"
+        logger.info(f"Starting Manager Agent workflow: {workflow_id}")
+
+        portfolio_context = json.dumps(portfolio_data, indent=2) if portfolio_data else (
+            "Projects: AURA MVP (On Track), Chevron Sand Mgmt (In Progress), "
+            "WWT Enhancement (At Risk), Middle East (Active). "
+            "Total budget: $2.75M. Pending approvals: 3."
+        )
+
+        output, call, decision, gate_status, review = self._governed_call(
+            agent_name="manager_agent",
+            system_prompt=(
+                "You are a Portfolio Manager Agent for First Genesis. "
+                "Consolidate agent outputs and generate executive portfolio dashboards. "
+                "Output ONLY valid JSON with keys: recommendation, confidence_score (0-1), "
+                "reasoning (list), assumptions (list), portfolio_health (STRONG|MODERATE|AT_RISK), "
+                "projects_summary (list), budget_summary (object), top_risks (list), "
+                "pending_decisions (list), key_metrics (object)."
+            ),
+            user_message=f"""Generate portfolio status dashboard:
+
+{portfolio_context}
+
+Provide executive summary with all projects at a glance, budget summary, top risks, and pending decisions.""",
+            workflow_id=workflow_id,
+            sensitivity_flag=False,
+            data_sources=["All agent outputs", "Portfolio metadata", "Resource constraints", "Risk register"],
+        )
+
+        if not output:
+            raise RuntimeError(f"Manager Agent call failed: {call.reason}")
+
+        workflow_state = self.stage_gate_manager.pause_at_gate(
+            workflow_id=workflow_id, agent_name="manager_agent", project_name=project_name,
+            stage_gate_name=StageGateName.DELIVERY_APPROVAL,
             content_pending_approval=output
         )
         logger.info(f"Workflow {workflow_id} paused at {workflow_state.current_stage_gate.value}")
@@ -3279,6 +3556,50 @@ def main():
                 print(f"  Reason:  {reason}")
                 if snippet:
                     print(f"  Snippet: {snippet[:80]}...")
+
+    # ── Legacy agent governance commands ─────────────────────────────────────
+    elif command == "run_ba_agent":
+        output, wf = agent.run_ba_agent_with_gates(
+            project_name="AURA MVP",
+            transcript=(
+                "We need to support 1000 users per minute. The system must work on mobile "
+                "and desktop. Security is critical — 2FA and encryption required. "
+                "The UI should allow any task in 3 clicks or fewer."
+            ),
+        )
+        print(f"\n✅ BA Agent complete. Workflow: {wf.workflow_id}")
+        print(f"   Status: {wf.status.value}")
+        print(f"   Output preview: {output[:200]}…")
+
+    elif command == "run_qa_agent":
+        pending = agent.db.get_pending_approvals()
+        source_wf_id = pending[0].workflow_id if pending else "no_workflow"
+        project = pending[0].project_name if pending else "AURA MVP"
+        output, wf = agent.run_qa_agent_with_gates(source_wf_id, project)
+        print(f"\n✅ QA Agent complete. Workflow: {wf.workflow_id}")
+        print(f"   Status: {wf.status.value}")
+        print(f"   Output preview: {output[:200]}…")
+
+    elif command == "run_vendor_agent":
+        output, wf = agent.run_vendor_agent_with_gates(
+            vendor_name="Yubi",
+            metrics={
+                "on_time_delivery_pct": 98,
+                "quality_score": 92,
+                "response_time_hours": 18,
+                "budget_variance_pct": 3,
+                "period": "March 2026",
+            },
+        )
+        print(f"\n✅ Vendor Agent complete. Workflow: {wf.workflow_id}")
+        print(f"   Status: {wf.status.value}")
+        print(f"   Output preview: {output[:200]}…")
+
+    elif command == "run_manager_agent":
+        output, wf = agent.run_manager_agent_with_gates()
+        print(f"\n✅ Manager Agent complete. Workflow: {wf.workflow_id}")
+        print(f"   Status: {wf.status.value}")
+        print(f"   Output preview: {output[:200]}…")
 
     # ── Sales pipeline governance commands ───────────────────────────────────
     elif command == "sales_qualify":

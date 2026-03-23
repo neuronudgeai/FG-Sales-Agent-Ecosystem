@@ -411,6 +411,90 @@ class GatedOrchestrator:
         print(f"  Workflow ID: {results['workflow_id']}")
         print(f"  Duration: {results['started_at']} → {results.get('completed_at','')}")
 
+    # ── Legacy agent wrappers ─────────────────────────────────────────────────
+    # These wrap AutonomousAgentWithEmailGates so all 5 legacy agents are
+    # accessible from the orchestrator with governance metadata printed.
+
+    def _legacy_agent(self):
+        """Lazy-init the legacy agent system."""
+        if not hasattr(self, "_legacy"):
+            from claude_code_agent_ecosystem import AutonomousAgentWithEmailGates
+            self._legacy = AutonomousAgentWithEmailGates()
+        return self._legacy
+
+    def run_pm_agent(self, project_metadata: Optional[Dict] = None) -> None:
+        """Run PM Agent with full governance (charter → email gate + ReviewGate)."""
+        metadata = project_metadata or {
+            "project": "AURA MVP", "client": "Malcolm Goodwin",
+            "budget": 150000, "timeline": "3 months",
+            "scope": "Silhouette technology + 3D mesh design",
+        }
+        print(f"\n{'═'*60}")
+        print("  PM AGENT — Charter Generation")
+        print(f"{'═'*60}")
+        output, wf = self._legacy_agent().run_pm_agent_with_gates(metadata)
+        print(f"\n  Workflow: {wf.workflow_id}")
+        print(f"  Gate:     {wf.current_stage_gate.value}")
+        print(f"  Status:   {wf.status.value}")
+        print(f"  Preview:  {output[:150]}…")
+
+    def run_ba_agent(self, project_name: str = "AURA MVP", transcript: str = "") -> None:
+        """Run BA Agent with full governance (requirements → email gate + ReviewGate)."""
+        transcript = transcript or (
+            "We need to support 1000 concurrent users. The system must work on mobile "
+            "and desktop. Security is critical — 2FA and AES-256 encryption required. "
+            "The UI should allow any core task in 3 clicks or fewer. "
+            "Integration with existing Salesforce CRM is mandatory."
+        )
+        print(f"\n{'═'*60}")
+        print("  BA AGENT — Requirements Extraction")
+        print(f"{'═'*60}")
+        output, wf = self._legacy_agent().run_ba_agent_with_gates(project_name, transcript)
+        print(f"\n  Workflow: {wf.workflow_id}")
+        print(f"  Gate:     {wf.current_stage_gate.value}")
+        print(f"  Status:   {wf.status.value}")
+        print(f"  Preview:  {output[:150]}…")
+
+    def run_qa_agent(self, workflow_id_to_audit: str = "", project_name: str = "AURA MVP") -> None:
+        """Run QA Agent with full governance (pre-delivery audit → email gate + ReviewGate)."""
+        print(f"\n{'═'*60}")
+        print("  QA AGENT — Pre-Delivery Audit")
+        print(f"{'═'*60}")
+        output, wf = self._legacy_agent().run_qa_agent_with_gates(
+            workflow_id_to_audit or "no_prior_workflow", project_name
+        )
+        print(f"\n  Workflow: {wf.workflow_id}")
+        print(f"  Gate:     {wf.current_stage_gate.value}")
+        print(f"  Status:   {wf.status.value}")
+        print(f"  Preview:  {output[:150]}…")
+
+    def run_vendor_agent(self, vendor_name: str = "Yubi", metrics: Optional[Dict] = None) -> None:
+        """Run Vendor Agent with full governance (SLA scorecard → email gate + ReviewGate)."""
+        metrics = metrics or {
+            "on_time_delivery_pct": 98, "quality_score": 92,
+            "response_time_hours": 18, "budget_variance_pct": 3,
+            "period": "March 2026",
+        }
+        print(f"\n{'═'*60}")
+        print(f"  VENDOR AGENT — {vendor_name} Scorecard")
+        print(f"{'═'*60}")
+        output, wf = self._legacy_agent().run_vendor_agent_with_gates(vendor_name, metrics)
+        print(f"\n  Workflow: {wf.workflow_id}")
+        print(f"  Gate:     {wf.current_stage_gate.value}")
+        print(f"  Status:   {wf.status.value}")
+        print(f"  Preview:  {output[:150]}…")
+
+    def run_manager_agent(self, portfolio_data: Optional[Dict] = None) -> None:
+        """Run Manager Agent with full governance (portfolio dashboard → email gate + ReviewGate)."""
+        print(f"\n{'═'*60}")
+        print("  MANAGER AGENT — Portfolio Dashboard")
+        print(f"{'═'*60}")
+        output, wf = self._legacy_agent().run_manager_agent_with_gates(portfolio_data)
+        print(f"\n  Workflow: {wf.workflow_id}")
+        print(f"  Gate:     {wf.current_stage_gate.value}")
+        print(f"  Status:   {wf.status.value}")
+        print(f"  Preview:  {output[:150]}…")
+
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
@@ -525,6 +609,26 @@ def main() -> None:
 
     elif cmd == "daily_cost":
         orchestrator.print_daily_cost()
+
+    # ── Legacy agent commands ──────────────────────────────────────────────────
+    elif cmd == "pm_agent":
+        orchestrator.run_pm_agent()
+
+    elif cmd == "ba_agent":
+        project = args[1] if len(args) > 1 else "AURA MVP"
+        orchestrator.run_ba_agent(project_name=project)
+
+    elif cmd == "qa_agent":
+        wf_id = args[1] if len(args) > 1 else ""
+        project = args[2] if len(args) > 2 else "AURA MVP"
+        orchestrator.run_qa_agent(workflow_id_to_audit=wf_id, project_name=project)
+
+    elif cmd == "vendor_agent":
+        vendor = args[1] if len(args) > 1 else "Yubi"
+        orchestrator.run_vendor_agent(vendor_name=vendor)
+
+    elif cmd == "manager_agent":
+        orchestrator.run_manager_agent()
 
     else:
         print(f"Unknown command: {cmd}")
