@@ -1703,6 +1703,159 @@ class WorkflowExecution:
     cost_usd: float
 
 # ============================================================================
+# HUMAN APPROVAL WORKFLOW COMPONENTS
+# ============================================================================
+
+class ApprovalStatus(Enum):
+    """Status of notification approval"""
+    PENDING  = "pending"   # Awaiting human approver review
+    APPROVED = "approved"  # Approved by human, ready to send
+    REJECTED = "rejected"  # Rejected, decision reconsidered
+    REVISED  = "revised"   # Changes requested, resubmitted
+    SENT     = "sent"      # Notifications sent to developers
+
+
+class ApprovalDecision(Enum):
+    """Human approver decision"""
+    APPROVE = "approve"  # Send notifications immediately
+    REVISE  = "revise"   # Request changes before sending
+    REJECT  = "reject"   # Do not send, reconsider decision
+
+
+@dataclass
+class ApprovalRequest:
+    """
+    Notification package awaiting human approver review.
+
+    Before PM Agent sends ANY notification to developers,
+    human approver must review and approve ALL 5 elements:
+      1. Clear decision context
+      2. Specific action items (per developer)
+      3. Deadlines
+      4. Resources / contacts
+      5. Confirmation requirements
+    """
+    # Core package contents
+    approval_id:               str
+    decision_id:               str
+    decision_context:          str
+    affected_developers:       List[str]
+    action_items:              Dict[str, str]      # {developer: action_item}
+    deadlines:                 Dict[str, datetime] # {developer: deadline}
+    resources:                 Dict[str, str]      # {developer: resources}
+    confirmation_requirements: Dict[str, str]      # {developer: requirements}
+
+    # Approval workflow
+    approval_status:      ApprovalStatus         = ApprovalStatus.PENDING
+    approver_name:        Optional[str]          = None
+    approver_timestamp:   Optional[datetime]     = None
+    approver_signature:   Optional[str]          = None
+    approver_notes:       Optional[str]          = None
+
+    # Tracking
+    created_timestamp:              datetime        = field(default_factory=datetime.now)
+    sent_to_approver_timestamp:     Optional[datetime] = None
+    approved_timestamp:             Optional[datetime] = None
+    sent_to_developers_timestamp:   Optional[datetime] = None
+
+    # Revisions
+    revision_count:   int        = 0
+    revision_history: List[Dict] = field(default_factory=list)
+
+
+class ApprovalChecklist:
+    """
+    5-point checklist human approver uses to review PM notifications.
+
+    Before approving, all 5 checks must pass:
+      1. Is decision context clear?   (developers understand WHY)
+      2. Are action items clear?      (developers know EXACT task)
+      3. Are deadlines reasonable?    (timelines achievable)
+      4. Are resources identified?    (devs have everything needed)
+      5. Are confirmations appropriate? (can track who confirms)
+    """
+
+    def __init__(self, approval_request: ApprovalRequest):
+        self.request = approval_request
+        self.checklist_results: Dict[str, bool] = {}
+
+    def check_context_clarity(self) -> bool:
+        """Is the decision context CLEAR? (non-empty and meaningful)"""
+        ctx = self.request.decision_context or ""
+        result = bool(ctx.strip()) and len(ctx) >= 20
+        self.checklist_results["context_clear"] = result
+        return result
+
+    def check_action_items_clarity(self) -> bool:
+        """Are ACTION ITEMS present for every affected developer?"""
+        items = self.request.action_items or {}
+        result = (
+            bool(items)
+            and all(self.request.affected_developers)
+            and all(items.get(dev, "").strip() for dev in self.request.affected_developers)
+        )
+        self.checklist_results["action_items_clear"] = result
+        return result
+
+    def check_deadline_reasonableness(self) -> bool:
+        """Are DEADLINES set and in the future for every developer?"""
+        deadlines = self.request.deadlines or {}
+        now = datetime.now()
+        result = (
+            bool(deadlines)
+            and all(
+                deadlines.get(dev) and deadlines[dev] > now
+                for dev in self.request.affected_developers
+            )
+        )
+        self.checklist_results["deadlines_reasonable"] = result
+        return result
+
+    def check_resources_identified(self) -> bool:
+        """Are RESOURCES identified for every developer?"""
+        resources = self.request.resources or {}
+        result = (
+            bool(resources)
+            and all(resources.get(dev, "").strip() for dev in self.request.affected_developers)
+        )
+        self.checklist_results["resources_identified"] = result
+        return result
+
+    def check_confirmation_requirements(self) -> bool:
+        """Are CONFIRMATION REQUIREMENTS set for every developer?"""
+        reqs = self.request.confirmation_requirements or {}
+        result = (
+            bool(reqs)
+            and all(reqs.get(dev, "").strip() for dev in self.request.affected_developers)
+        )
+        self.checklist_results["confirmations_appropriate"] = result
+        return result
+
+    def all_checks_passed(self) -> bool:
+        """Return True only if ALL 5 checks pass."""
+        checks = [
+            self.check_context_clarity(),
+            self.check_action_items_clarity(),
+            self.check_deadline_reasonableness(),
+            self.check_resources_identified(),
+            self.check_confirmation_requirements(),
+        ]
+        return all(checks)
+
+    def get_failed_checks(self) -> List[str]:
+        """Return human-readable list of failed checks."""
+        self.all_checks_passed()  # ensure results are populated
+        labels = {
+            "context_clear":           "Decision context not clear",
+            "action_items_clear":      "Action items not clear for all developers",
+            "deadlines_reasonable":    "Deadlines missing or already past",
+            "resources_identified":    "Resources not identified for all developers",
+            "confirmations_appropriate": "Confirmation requirements missing",
+        }
+        return [labels[k] for k, v in self.checklist_results.items() if not v]
+
+
+# ============================================================================
 # DATABASE
 # ============================================================================
 class WorkflowDatabase:
@@ -1766,6 +1919,27 @@ class WorkflowDatabase:
                 timestamp TEXT NOT NULL,
                 flag_reason TEXT NOT NULL,
                 output_snippet TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS approval_requests (
+                approval_id              TEXT PRIMARY KEY,
+                workflow_id              TEXT NOT NULL,
+                agent_name               TEXT NOT NULL,
+                project_name             TEXT NOT NULL,
+                decision_context         TEXT,
+                affected_developers      TEXT,  -- JSON list
+                action_items             TEXT,  -- JSON dict
+                deadlines                TEXT,  -- JSON dict {dev: ISO datetime}
+                resources                TEXT,  -- JSON dict
+                confirmation_requirements TEXT, -- JSON dict
+                approval_status          TEXT DEFAULT 'pending',
+                approver_name            TEXT,
+                approver_notes           TEXT,
+                checklist_results        TEXT,  -- JSON dict {check: bool}
+                all_checks_passed        INTEGER DEFAULT 0,
+                created_timestamp        TEXT,
+                approved_timestamp       TEXT,
+                FOREIGN KEY(workflow_id) REFERENCES workflows(workflow_id)
             );
         """)
         self.conn.commit()
@@ -1842,6 +2016,57 @@ class WorkflowDatabase:
               datetime.now().isoformat()))
         self.conn.commit()
         logger.info(f"Approval recorded for {workflow_id}: {decision}")
+
+    def save_approval_request(self, req: ApprovalRequest,
+                              checklist_results: Dict[str, bool],
+                              all_checks_passed: bool) -> None:
+        """Persist an ApprovalRequest + its checklist outcome."""
+        self.cursor.execute("""
+            INSERT OR REPLACE INTO approval_requests
+            (approval_id, workflow_id, agent_name, project_name,
+             decision_context, affected_developers, action_items,
+             deadlines, resources, confirmation_requirements,
+             approval_status, approver_name, approver_notes,
+             checklist_results, all_checks_passed, created_timestamp, approved_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            req.approval_id,
+            req.decision_id,
+            "",                # agent_name filled by caller if needed
+            "",                # project_name filled by caller if needed
+            req.decision_context,
+            json.dumps(req.affected_developers),
+            json.dumps(req.action_items),
+            json.dumps({k: v.isoformat() for k, v in req.deadlines.items()}),
+            json.dumps(req.resources),
+            json.dumps(req.confirmation_requirements),
+            req.approval_status.value,
+            req.approver_name,
+            req.approver_notes,
+            json.dumps(checklist_results),
+            int(all_checks_passed),
+            req.created_timestamp.isoformat(),
+            req.approved_timestamp.isoformat() if req.approved_timestamp else None,
+        ))
+        self.conn.commit()
+        logger.info(f"ApprovalRequest {req.approval_id} saved (checks_passed={all_checks_passed})")
+
+    def get_approval_request(self, approval_id: str) -> Optional[Dict]:
+        """Return a raw dict of the stored ApprovalRequest row (for inspection/audit)."""
+        self.cursor.execute(
+            "SELECT * FROM approval_requests WHERE approval_id = ?", (approval_id,)
+        )
+        row = self.cursor.fetchone()
+        if not row:
+            return None
+        cols = [
+            "approval_id", "workflow_id", "agent_name", "project_name",
+            "decision_context", "affected_developers", "action_items",
+            "deadlines", "resources", "confirmation_requirements",
+            "approval_status", "approver_name", "approver_notes",
+            "checklist_results", "all_checks_passed", "created_timestamp", "approved_timestamp",
+        ]
+        return dict(zip(cols, row))
 
     # ── Agent calls ───────────────────────────────────────────────────────────
 
@@ -2048,6 +2273,29 @@ class StageGateManager:
         )
         self.db.save_workflow_state(workflow_state)
 
+        # ── ApprovalChecklist gate (PM Agent charter notifications) ───────────
+        if agent_name == "pm_agent" and stage_gate_name == StageGateName.CHARTER_APPROVAL:
+            approval_req = self._build_approval_request(
+                workflow_id, agent_name, project_name, content_pending_approval
+            )
+            checklist = ApprovalChecklist(approval_req)
+            checks_passed = checklist.all_checks_passed()
+
+            self.db.save_approval_request(approval_req, checklist.checklist_results, checks_passed)
+
+            if not checks_passed:
+                failed = checklist.get_failed_checks()
+                logger.warning(
+                    f"ApprovalChecklist FAILED for {workflow_id} — "
+                    f"notification held. Failed checks: {failed}"
+                )
+                workflow_state.next_step_after_approval = (
+                    f"Checklist failed — resolve before sending: {'; '.join(failed)}"
+                )
+                self.db.save_workflow_state(workflow_state)
+                return workflow_state  # hold here; do NOT send email
+        # ─────────────────────────────────────────────────────────────────────
+
         email_sent = self.email.send_approval_request(
             workflow_id=workflow_id, stage_gate=stage_gate,
             agent_name=agent_name, project_name=project_name,
@@ -2081,16 +2329,106 @@ class StageGateManager:
             workflow_state.human_feedback = feedback
             workflow_state.approval_timestamp = datetime.now().isoformat()
             logger.info(f"Workflow {workflow_id} APPROVED by {approver_email}")
+            # Stamp the ApprovalRequest as APPROVED if one exists
+            approval_req_row = self.db.get_approval_request(f"apr_{workflow_id}")
+            if approval_req_row:
+                self.db.cursor.execute(
+                    "UPDATE approval_requests SET approval_status=?, approver_name=?, "
+                    "approved_timestamp=? WHERE approval_id=?",
+                    (ApprovalStatus.APPROVED.value, approver_email,
+                     datetime.now().isoformat(), f"apr_{workflow_id}")
+                )
+                self.db.conn.commit()
         elif decision.lower() == "rejected":
             workflow_state.status = WorkflowStatus.REJECTED
             workflow_state.human_approver = approver_email
             workflow_state.human_feedback = feedback
             logger.warning(f"Workflow {workflow_id} REJECTED by {approver_email}: {feedback}")
+        elif decision.lower() in ("revise", "revised"):
+            # Return to PENDING so PM Agent can regenerate with the approver's notes
+            workflow_state.status = WorkflowStatus.PENDING
+            workflow_state.human_approver = approver_email
+            workflow_state.human_feedback = feedback
+            workflow_state.next_step_after_approval = (
+                f"Revision requested by {approver_email}: {feedback or 'No notes provided'}"
+            )
+            logger.info(f"Workflow {workflow_id} sent back for REVISION by {approver_email}")
+            # Update the stored ApprovalRequest status if one exists
+            approval_req_row = self.db.get_approval_request(f"apr_{workflow_id}")
+            if approval_req_row:
+                self.db.cursor.execute(
+                    "UPDATE approval_requests SET approval_status=?, approver_name=?, approver_notes=? "
+                    "WHERE approval_id=?",
+                    (ApprovalStatus.REVISED.value, approver_email, feedback, f"apr_{workflow_id}")
+                )
+                self.db.conn.commit()
         else:
             logger.warning(f"Unknown decision for {workflow_id}: {decision}")
 
         self.db.save_workflow_state(workflow_state)
         return workflow_state
+
+    def _build_approval_request(self, workflow_id: str, agent_name: str,
+                                project_name: str, content: str) -> ApprovalRequest:
+        """Build an ApprovalRequest from PM Agent charter JSON output."""
+        charter_data: Dict = {}
+        wbs_data: Dict = {}
+        try:
+            parsed = json.loads(content)
+            charter_data = parsed.get("project_charter", {})
+            wbs_data     = parsed.get("wbs", {})
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
+        decision_context = (
+            f"Project: {charter_data.get('title', project_name)} | "
+            f"Client: {charter_data.get('client', 'Unknown')} | "
+            f"Timeline: {charter_data.get('timeline', 'TBD')} | "
+            f"Workflow: {workflow_id}"
+        )
+
+        # Extract team names from charter; fall back to known FG team
+        raw_team = charter_data.get("team", {})
+        if isinstance(raw_team, dict) and raw_team:
+            developers = list(raw_team.keys())
+        elif isinstance(raw_team, list) and raw_team:
+            developers = [str(d) for d in raw_team]
+        else:
+            developers = ["Kiera", "Elina", "Ron"]
+
+        # Action items from first WBS phase per developer; default if absent
+        wbs_values = list(wbs_data.values()) if isinstance(wbs_data, dict) else []
+        action_items = {
+            dev: (str(wbs_values[0]) if wbs_values else f"Review {project_name} charter and confirm scope")
+            for dev in developers
+        }
+
+        # Deadlines from charter timeline string (e.g. "12 weeks" → datetime)
+        timeline_str = str(charter_data.get("timeline", "12 weeks"))
+        digits = "".join(c for c in timeline_str if c.isdigit())
+        weeks = int(digits) if digits else 12
+        deadline = datetime.now() + timedelta(weeks=weeks)
+        deadlines = {dev: deadline for dev in developers}
+
+        resources = {
+            dev: "Project charter, WBS, First Genesis templates — contact PMO for questions"
+            for dev in developers
+        }
+        confirmation_requirements = {
+            dev: "Reply CONFIRMED to this notification within 48 hours; escalate to PMO if blocked"
+            for dev in developers
+        }
+
+        return ApprovalRequest(
+            approval_id=f"apr_{workflow_id}",
+            decision_id=workflow_id,
+            decision_context=decision_context,
+            affected_developers=developers,
+            action_items=action_items,
+            deadlines=deadlines,
+            resources=resources,
+            confirmation_requirements=confirmation_requirements,
+        )
 
     def get_pending_approvals_summary(self) -> str:
         pending = self.db.get_pending_approvals()
