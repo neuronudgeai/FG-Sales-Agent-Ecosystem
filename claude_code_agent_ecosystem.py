@@ -1856,6 +1856,384 @@ class ApprovalChecklist:
 
 
 # ============================================================================
+# PM NOTIFICATION ENGINE
+# ============================================================================
+class PMNotificationEngine:
+    """
+    PM Agent's notification system with HUMAN APPROVAL GATE.
+
+    Workflow:
+      1. prepare_notification_package()  → create ApprovalRequest, store as PENDING
+      2. wait_for_approval()             → check stage gate DB; block until decision
+      3. APPROVED  → send_approved_notifications() → notify developers, track confirmations
+      4. REVISED   → return to PM Agent for changes
+      5. REJECTED  → escalate back to Manager Agent
+    """
+
+    def __init__(self, db: Optional["WorkflowDatabase"] = None):
+        self.db = db
+        self.pending_approvals:      Dict[str, ApprovalRequest] = {}
+        self.approved_approvals:     Dict[str, ApprovalRequest] = {}
+        self.notification_log:       List[Dict] = []
+        self.developer_confirmations: Dict[str, Dict] = {}
+
+    # ── Prepare ────────────────────────────────────────────────────────────────
+
+    def prepare_notification_package(
+        self,
+        decision: dict,
+        affected_developers: List[str],
+        action_items: Dict[str, str],
+        deadlines: Dict[str, datetime],
+        resources: Dict[str, str],
+        confirmation_requirements: Dict[str, str],
+    ) -> ApprovalRequest:
+        """
+        Build an ApprovalRequest and hold it for human review.
+        Does NOT send anything to developers yet.
+        """
+        approval_id = f"APR_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        request = ApprovalRequest(
+            approval_id=approval_id,
+            decision_id=decision.get("id", "UNKNOWN"),
+            decision_context=decision.get("context", ""),
+            affected_developers=affected_developers,
+            action_items=action_items,
+            deadlines=deadlines,
+            resources=resources,
+            confirmation_requirements=confirmation_requirements,
+        )
+
+        self.pending_approvals[approval_id] = request
+        request.sent_to_approver_timestamp = datetime.now()
+
+        print(f"✓ Notification package prepared: {approval_id}")
+        print(f"  Status: AWAITING HUMAN APPROVER REVIEW")
+        print(f"  Developers: {', '.join(affected_developers)}")
+        print(f"  NOT YET SENT TO DEVELOPERS")
+
+        return request
+
+    # ── Wait for approval ──────────────────────────────────────────────────────
+
+    def wait_for_approval(self, approval_request: ApprovalRequest) -> Optional[ApprovalDecision]:
+        """
+        Check the stage gate DB for an existing human decision.
+
+        - APPROVED  → stamps request and returns ApprovalDecision.APPROVE
+        - REJECTED  → stamps request and returns ApprovalDecision.REJECT
+        - REVISED   → stamps request and returns ApprovalDecision.REVISE
+        - Still PENDING → prints waiting message and returns None
+
+        In production, this is called by resume_approved_workflow() after
+        the human replies via email/Slack/Telegram/WhatsApp.
+        """
+        # ── Check persistent DB first ─────────────────────────────────────────
+        if self.db:
+            wf = self.db.get_workflow_state(approval_request.decision_id)
+            if wf:
+                if wf.status == WorkflowStatus.APPROVED:
+                    approval_request.approval_status  = ApprovalStatus.APPROVED
+                    approval_request.approver_name    = wf.human_approver or "Human Approver"
+                    approval_request.approver_timestamp = datetime.now()
+                    approval_request.approver_signature = "✓ APPROVED via stage gate"
+                    return ApprovalDecision.APPROVE
+                if wf.status == WorkflowStatus.REJECTED:
+                    approval_request.approval_status = ApprovalStatus.REJECTED
+                    approval_request.approver_name   = wf.human_approver or "Human Approver"
+                    approval_request.approver_notes  = wf.human_feedback
+                    return ApprovalDecision.REJECT
+                if wf.status == WorkflowStatus.PENDING and wf.next_step_after_approval and \
+                        "revision" in wf.next_step_after_approval.lower():
+                    approval_request.approval_status = ApprovalStatus.REVISED
+                    approval_request.approver_name   = wf.human_approver or "Human Approver"
+                    approval_request.approver_notes  = wf.human_feedback
+                    approval_request.revision_count += 1
+                    return ApprovalDecision.REVISE
+
+        # ── Still awaiting human decision ─────────────────────────────────────
+        print(f"\n🚨 HUMAN APPROVER REVIEW REQUIRED 🚨")
+        print(f"Approval ID: {approval_request.approval_id}")
+        print(f"Decision:    {approval_request.decision_context}")
+        print(f"Developers:  {', '.join(approval_request.affected_developers)}")
+        print(f"\nApprover must verify:")
+        print(f"  ☐ Decision context clear?")
+        print(f"  ☐ Action items clear?")
+        print(f"  ☐ Deadlines reasonable?")
+        print(f"  ☐ Resources identified?")
+        print(f"  ☐ Confirmation requirements appropriate?")
+        print(f"\n⏳ Awaiting human decision: APPROVE / REVISE / REJECT")
+        return None  # decision not yet received
+
+    # ── Send ───────────────────────────────────────────────────────────────────
+
+    def send_approved_notifications(
+        self, approval_request: ApprovalRequest
+    ) -> Dict[str, dict]:
+        """
+        Send notifications to developers — ONLY after human approval.
+
+        Also persists each notification to the DB notification_log table
+        and initialises confirmation tracking per developer.
+        """
+        if approval_request.approval_status != ApprovalStatus.APPROVED:
+            print(f"❌ CANNOT SEND — not approved (status: {approval_request.approval_status.value})")
+            return {}
+
+        sent: Dict[str, dict] = {}
+        now = datetime.now()
+
+        for dev in approval_request.affected_developers:
+            notification = {
+                "approval_id":          approval_request.approval_id,
+                "developer":            dev,
+                "decision_context":     approval_request.decision_context,
+                "action_item":          approval_request.action_items.get(dev),
+                "deadline":             approval_request.deadlines.get(dev),
+                "resources":            approval_request.resources.get(dev),
+                "confirmation_required": approval_request.confirmation_requirements.get(dev),
+                "approver_name":        approval_request.approver_name,
+                "approver_timestamp":   approval_request.approver_timestamp,
+                "sent_timestamp":       now,
+            }
+
+            # In-memory confirmation tracker
+            self.developer_confirmations[dev] = {
+                "approval_id":          approval_request.approval_id,
+                "acknowledged":         False,
+                "acknowledged_timestamp": None,
+                "confirmation_deadline": approval_request.deadlines.get(dev),
+            }
+
+            sent[dev] = notification
+
+            # In-memory log
+            self.notification_log.append({
+                "approval_id":    approval_request.approval_id,
+                "developer":      dev,
+                "sent_timestamp": now,
+                "status":         "SENT",
+            })
+
+            # Persist to DB
+            if self.db:
+                self.db.log_notification(
+                    approval_id=approval_request.approval_id,
+                    developer=dev,
+                    decision_context=approval_request.decision_context,
+                    action_item=approval_request.action_items.get(dev, ""),
+                    deadline=approval_request.deadlines.get(dev),
+                    resources=approval_request.resources.get(dev, ""),
+                    approver_name=approval_request.approver_name or "",
+                )
+
+        approval_request.approval_status = ApprovalStatus.SENT
+        approval_request.sent_to_developers_timestamp = now
+        self.approved_approvals[approval_request.approval_id] = approval_request
+        self.pending_approvals.pop(approval_request.approval_id, None)
+
+        print(f"\n✓ APPROVED notifications sent to {len(sent)} developers")
+        print(f"  Approval ID: {approval_request.approval_id}")
+        print(f"  Approved by: {approval_request.approver_name}")
+        print(f"  Sent at:     {now.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        return sent
+
+    # ── Confirmation tracking ──────────────────────────────────────────────────
+
+    def track_developer_confirmations(self, approval_id: str) -> Dict[str, dict]:
+        """Return confirmation status for all developers on this approval."""
+        result = {
+            dev: status
+            for dev, status in self.developer_confirmations.items()
+            if status.get("approval_id") == approval_id
+        }
+        # Also pull from DB if available
+        if self.db and not result:
+            result = self.db.get_developer_confirmations(approval_id)
+        return result
+
+    def receive_developer_confirmation(self, developer: str, approval_id: str) -> None:
+        """Log that a developer has acknowledged their notification."""
+        now = datetime.now()
+
+        if developer in self.developer_confirmations:
+            self.developer_confirmations[developer]["acknowledged"] = True
+            self.developer_confirmations[developer]["acknowledged_timestamp"] = now
+
+        self.notification_log.append({
+            "approval_id": approval_id,
+            "developer":   developer,
+            "event":       "CONFIRMATION_RECEIVED",
+            "timestamp":   now,
+        })
+
+        if self.db:
+            self.db.record_developer_confirmation(developer, approval_id, now)
+
+        logger.info(f"Developer confirmation received: {developer} for {approval_id}")
+
+
+# ============================================================================
+# MANAGER BOT — approval orchestrator
+# ============================================================================
+class ManagerBot:
+    """
+    Orchestrates the human approval gate between PM Agent and developers.
+
+    Sits above PMNotificationEngine:
+      PM Agent → ManagerBot.notify_approver_for_review()
+                      → human reviews
+                      → ManagerBot.receive_approval_decision()
+                          APPROVE → PMNotificationEngine.send_approved_notifications()
+                          REVISE  → PM Agent regenerates notification
+                          REJECT  → ManagerBot.escalate_if_rejected() → reconsider decision
+    """
+
+    def __init__(
+        self,
+        pm_notification_engine: "PMNotificationEngine",
+        stage_gate_manager: "StageGateManager",
+        db: "WorkflowDatabase",
+    ):
+        self.pm_engine   = pm_notification_engine
+        self.gate_mgr    = stage_gate_manager
+        self.db          = db
+
+    def notify_approver_for_review(self, approval_request: ApprovalRequest) -> str:
+        """
+        Escalate a notification package to the human approver for review.
+
+        Called BEFORE any notifications reach developers.
+        Human must respond with APPROVE / REVISE / REJECT.
+
+        Returns:
+            approval_id for tracking
+        """
+        print(f"\n🚨 ESCALATING TO HUMAN APPROVER 🚨")
+        print(f"Approval ID: {approval_request.approval_id}")
+        print(f"Package ready for human review")
+        print(f"Awaiting: APPROVE / REVISE / REJECT decision")
+        return approval_request.approval_id
+
+    def receive_approval_decision(
+        self,
+        approval_id: str,
+        decision: ApprovalDecision,
+        approver_name: str,
+        notes: Optional[str] = None,
+    ) -> dict:
+        """
+        Process the human approver's decision and route accordingly.
+
+        - APPROVE → mark ApprovalRequest approved, hand off to PMNotificationEngine
+        - REVISE  → return to PM Agent for changes, increment revision count
+        - REJECT  → escalate back to ManagerBot for decision reconsideration
+
+        Returns:
+            {status, next_step, approver, notes?}
+        """
+        # Find the pending ApprovalRequest by approval_id
+        apr_req = self.pm_engine.pending_approvals.get(approval_id)
+
+        if decision == ApprovalDecision.APPROVE:
+            if apr_req:
+                apr_req.approval_status    = ApprovalStatus.APPROVED
+                apr_req.approver_name      = approver_name
+                apr_req.approver_timestamp = datetime.now()
+                apr_req.approver_signature = "✓ APPROVED"
+                apr_req.approver_notes     = notes
+            # Also update the stage gate DB record
+            if apr_req:
+                self.gate_mgr.record_approval_response(
+                    workflow_id=apr_req.decision_id,
+                    approver_email=approver_name,
+                    decision="approved",
+                    feedback=notes,
+                )
+            return {
+                "status":     "APPROVED",
+                "next_step":  "Send notifications to developers",
+                "approver":   approver_name,
+            }
+
+        elif decision == ApprovalDecision.REVISE:
+            if apr_req:
+                apr_req.approval_status = ApprovalStatus.REVISED
+                apr_req.approver_name   = approver_name
+                apr_req.approver_notes  = notes
+                apr_req.revision_count += 1
+                apr_req.revision_history.append({
+                    "revision":   apr_req.revision_count,
+                    "approver":   approver_name,
+                    "notes":      notes,
+                    "timestamp":  datetime.now().isoformat(),
+                })
+            if apr_req:
+                self.gate_mgr.record_approval_response(
+                    workflow_id=apr_req.decision_id,
+                    approver_email=approver_name,
+                    decision="revised",
+                    feedback=notes,
+                )
+            return {
+                "status":    "REVISION_REQUESTED",
+                "next_step": "PM Agent makes revisions and resubmits",
+                "approver":  approver_name,
+                "notes":     notes,
+            }
+
+        elif decision == ApprovalDecision.REJECT:
+            if apr_req:
+                apr_req.approval_status = ApprovalStatus.REJECTED
+                apr_req.approver_name   = approver_name
+                apr_req.approver_notes  = notes
+            if apr_req:
+                self.gate_mgr.record_approval_response(
+                    workflow_id=apr_req.decision_id,
+                    approver_email=approver_name,
+                    decision="rejected",
+                    feedback=notes,
+                )
+            return {
+                "status":    "REJECTED",
+                "next_step": "Escalate back to Manager Bot to reconsider",
+                "approver":  approver_name,
+                "notes":     notes,
+            }
+
+        return {"status": "UNKNOWN", "next_step": "No action taken"}
+
+    def escalate_if_rejected(self, approval_id: str, approver_notes: str) -> dict:
+        """
+        When human rejects, escalate back to ManagerBot so the underlying
+        decision — not just the notification wording — can be reconsidered.
+        """
+        print(f"\n❌ DECISION REJECTED BY HUMAN APPROVER")
+        print(f"Approval ID: {approval_id}")
+        print(f"Reason: {approver_notes}")
+        print(f"Action: Return to Manager Bot for reconsideration")
+
+        # Mark in DB so the workflow is clearly flagged
+        row = self.db.get_approval_request_by_workflow(approval_id)
+        if row:
+            self.db.cursor.execute(
+                "UPDATE approval_requests SET approval_status=?, approver_notes=? WHERE approval_id=?",
+                (ApprovalStatus.REJECTED.value, approver_notes, row["approval_id"])
+            )
+            self.db.conn.commit()
+
+        logger.warning(f"ManagerBot escalation: approval {approval_id} rejected — {approver_notes}")
+
+        return {
+            "status": "ESCALATED",
+            "action": "Reconsider original decision",
+            "reason": approver_notes,
+        }
+
+
+# ============================================================================
 # DATABASE
 # ============================================================================
 class WorkflowDatabase:
@@ -1940,6 +2318,30 @@ class WorkflowDatabase:
                 created_timestamp        TEXT,
                 approved_timestamp       TEXT,
                 FOREIGN KEY(workflow_id) REFERENCES workflows(workflow_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS notification_log (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                approval_id      TEXT NOT NULL,
+                developer        TEXT NOT NULL,
+                sent_timestamp   TEXT NOT NULL,
+                status           TEXT NOT NULL DEFAULT 'SENT',
+                decision_context TEXT,
+                action_item      TEXT,
+                deadline         TEXT,
+                resources        TEXT,
+                approver_name    TEXT,
+                FOREIGN KEY(approval_id) REFERENCES approval_requests(approval_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS developer_confirmations (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                approval_id             TEXT NOT NULL,
+                developer               TEXT NOT NULL,
+                acknowledged            INTEGER NOT NULL DEFAULT 0,
+                acknowledged_timestamp  TEXT,
+                confirmation_deadline   TEXT,
+                FOREIGN KEY(approval_id) REFERENCES approval_requests(approval_id)
             );
         """)
         self.conn.commit()
@@ -2067,6 +2469,76 @@ class WorkflowDatabase:
             "checklist_results", "all_checks_passed", "created_timestamp", "approved_timestamp",
         ]
         return dict(zip(cols, row))
+
+    def get_approval_request_by_workflow(self, workflow_id: str) -> Optional[Dict]:
+        """Return the ApprovalRequest row linked to a workflow_id (for resume flow)."""
+        self.cursor.execute(
+            "SELECT * FROM approval_requests WHERE workflow_id = ? ORDER BY created_timestamp DESC LIMIT 1",
+            (workflow_id,)
+        )
+        row = self.cursor.fetchone()
+        if not row:
+            return None
+        cols = [
+            "approval_id", "workflow_id", "agent_name", "project_name",
+            "decision_context", "affected_developers", "action_items",
+            "deadlines", "resources", "confirmation_requirements",
+            "approval_status", "approver_name", "approver_notes",
+            "checklist_results", "all_checks_passed", "created_timestamp", "approved_timestamp",
+        ]
+        return dict(zip(cols, row))
+
+    # ── Notification log ──────────────────────────────────────────────────────
+
+    def log_notification(self, approval_id: str, developer: str, decision_context: str,
+                         action_item: str, deadline: Optional[datetime],
+                         resources: str, approver_name: str) -> None:
+        """Persist a sent notification entry."""
+        self.cursor.execute("""
+            INSERT INTO notification_log
+            (approval_id, developer, sent_timestamp, status, decision_context,
+             action_item, deadline, resources, approver_name)
+            VALUES (?, ?, ?, 'SENT', ?, ?, ?, ?, ?)
+        """, (
+            approval_id, developer, datetime.now().isoformat(),
+            decision_context, action_item,
+            deadline.isoformat() if deadline else None,
+            resources, approver_name,
+        ))
+        self.conn.commit()
+
+    def record_developer_confirmation(self, developer: str, approval_id: str,
+                                      timestamp: datetime) -> None:
+        """Upsert developer confirmation into the DB."""
+        # Try update first; insert if row doesn't exist
+        self.cursor.execute("""
+            UPDATE developer_confirmations
+            SET acknowledged=1, acknowledged_timestamp=?
+            WHERE approval_id=? AND developer=?
+        """, (timestamp.isoformat(), approval_id, developer))
+        if self.cursor.rowcount == 0:
+            self.cursor.execute("""
+                INSERT INTO developer_confirmations
+                (approval_id, developer, acknowledged, acknowledged_timestamp)
+                VALUES (?, ?, 1, ?)
+            """, (approval_id, developer, timestamp.isoformat()))
+        self.conn.commit()
+
+    def get_developer_confirmations(self, approval_id: str) -> Dict[str, dict]:
+        """Return {developer: {acknowledged, acknowledged_timestamp, ...}} for an approval."""
+        self.cursor.execute("""
+            SELECT developer, acknowledged, acknowledged_timestamp, confirmation_deadline
+            FROM developer_confirmations WHERE approval_id=?
+        """, (approval_id,))
+        return {
+            row[0]: {
+                "approval_id":            approval_id,
+                "acknowledged":           bool(row[1]),
+                "acknowledged_timestamp": row[2],
+                "confirmation_deadline":  row[3],
+            }
+            for row in self.cursor.fetchall()
+        }
 
     # ── Agent calls ───────────────────────────────────────────────────────────
 
@@ -2625,7 +3097,9 @@ class AutonomousAgentWithEmailGates:
             self.router = email_gw
             logger.info("NotificationRouter not available — using email-only gateway")
 
-        self.stage_gate_manager = StageGateManager(self.db, self.router)
+        self.stage_gate_manager     = StageGateManager(self.db, self.router)
+        self.pm_notification_engine = PMNotificationEngine(self.db)
+        self.manager_bot            = ManagerBot(self.pm_notification_engine, self.stage_gate_manager, self.db)
 
         # ── Knowledge injector ────────────────────────────────────────────────
         try:
@@ -2868,6 +3342,56 @@ Output as JSON only:
 
         if not output:
             raise RuntimeError(f"PM Agent call failed: {call.reason}")
+
+        # ── Build notification package for human approval gate ─────────────────
+        charter_data: dict = {}
+        wbs_data: dict = {}
+        try:
+            parsed = json.loads(output)
+            charter_data = parsed.get("project_charter", {})
+            wbs_data     = parsed.get("wbs", {})
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
+        raw_team = charter_data.get("team", {})
+        if isinstance(raw_team, dict) and raw_team:
+            developers = list(raw_team.keys())
+        elif isinstance(raw_team, list) and raw_team:
+            developers = [str(d) for d in raw_team]
+        else:
+            developers = ["Kiera", "Elina", "Ron"]
+
+        wbs_values = list(wbs_data.values()) if isinstance(wbs_data, dict) else []
+        timeline_str = str(charter_data.get("timeline", "12 weeks"))
+        digits = "".join(c for c in timeline_str if c.isdigit())
+        weeks = int(digits) if digits else 12
+        deadline = datetime.now() + timedelta(weeks=weeks)
+
+        self.pm_notification_engine.prepare_notification_package(
+            decision={
+                "id":      workflow_id,
+                "context": (
+                    f"Project: {charter_data.get('title', project_name)} | "
+                    f"Client: {charter_data.get('client', 'Unknown')} | "
+                    f"Timeline: {charter_data.get('timeline', 'TBD')}"
+                ),
+            },
+            affected_developers=developers,
+            action_items={
+                dev: (str(wbs_values[0]) if wbs_values else f"Review {project_name} charter")
+                for dev in developers
+            },
+            deadlines={dev: deadline for dev in developers},
+            resources={
+                dev: "Project charter, WBS, First Genesis templates"
+                for dev in developers
+            },
+            confirmation_requirements={
+                dev: "Reply CONFIRMED within 48 hours"
+                for dev in developers
+            },
+        )
+        # ─────────────────────────────────────────────────────────────────────
 
         workflow_state = self.stage_gate_manager.pause_at_gate(
             workflow_id=workflow_id, agent_name="pm_agent", project_name=project_name,
@@ -3140,6 +3664,42 @@ Provide executive summary with all projects at a glance, budget summary, top ris
         workflow_state.next_step_after_approval = next_action
         self.db.save_workflow_state(workflow_state)
         logger.info(f"Agent proceeding: {next_action}")
+
+        # ── Send developer notifications for charter approval ─────────────────
+        if workflow_state.current_stage_gate == StageGateName.CHARTER_APPROVAL:
+            # Find the matching ApprovalRequest (in-memory first, then DB)
+            apr_req = next(
+                (r for r in self.pm_notification_engine.pending_approvals.values()
+                 if r.decision_id == workflow_id),
+                None
+            )
+            if apr_req is None:
+                # Rebuild from DB row for restarts / cross-process runs
+                row = self.db.get_approval_request_by_workflow(workflow_id)
+                if row:
+                    apr_req = ApprovalRequest(
+                        approval_id=row["approval_id"],
+                        decision_id=workflow_id,
+                        decision_context=row.get("decision_context", ""),
+                        affected_developers=json.loads(row.get("affected_developers") or "[]"),
+                        action_items=json.loads(row.get("action_items") or "{}"),
+                        deadlines={},   # datetime reconstruction skipped for DB-reload path
+                        resources=json.loads(row.get("resources") or "{}"),
+                        confirmation_requirements=json.loads(
+                            row.get("confirmation_requirements") or "{}"
+                        ),
+                        approval_status=ApprovalStatus.APPROVED,
+                        approver_name=workflow_state.human_approver,
+                    )
+            if apr_req:
+                decision = self.pm_notification_engine.wait_for_approval(apr_req)
+                if decision == ApprovalDecision.APPROVE:
+                    self.pm_notification_engine.send_approved_notifications(apr_req)
+                elif decision == ApprovalDecision.REVISE:
+                    logger.info(f"Charter {workflow_id} sent back for revision")
+                elif decision == ApprovalDecision.REJECT:
+                    logger.warning(f"Charter {workflow_id} rejected — escalating")
+        # ─────────────────────────────────────────────────────────────────────
 
         # HubSpot CRM sync — notify on completion or gate advancement
         if hasattr(self, "router") and hasattr(self.router, "notify_hubspot_on_gate_approval"):
