@@ -69,9 +69,9 @@ except ImportError:
 MVP_ACTIVE_AGENTS: frozenset = frozenset({
     "pm_agent",
     "ba_agent",
-    "qa_agent",
-    "vendor_agent",
-    "manager_agent",
+    # "qa_agent"      → IDLE (Trice: PM/BA only for this sprint)
+    # "vendor_agent"  → IDLE
+    # "manager_agent" → IDLE
 })
 
 class AgentIdleError(RuntimeError):
