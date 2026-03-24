@@ -24,8 +24,10 @@ Usage:
     python claude_code_agent_ecosystem.py audit_hallucinations
 """
 import anthropic
+import csv
 import json
 import os
+import pathlib
 import re
 import sys
 import uuid
@@ -2615,6 +2617,62 @@ Check: all required deliverables present, no scope creep vs original RFP, all ac
         logger.info(f"Workflow {workflow_id} paused at {workflow_state.current_stage_gate.value}")
         return output, workflow_state
 
+    # ── Vendor cost CSV logger ────────────────────────────────────────────────
+
+    class VendorCostCSVLogger:
+        """Append one row per Vendor Agent call to vendor_cost_log.csv.
+
+        Columns
+        -------
+        timestamp, workflow_id, vendor_name, input_tokens, output_tokens,
+        cache_created, cache_read, cost_usd, status, sla_status,
+        escalation_required
+        """
+
+        COLUMNS = [
+            "timestamp", "workflow_id", "vendor_name",
+            "input_tokens", "output_tokens", "cache_created", "cache_read",
+            "cost_usd", "status", "sla_status", "escalation_required",
+        ]
+
+        def __init__(self, log_path: str = "vendor_cost_log.csv"):
+            self.log_path = pathlib.Path(log_path)
+            # Write header if the file doesn't exist yet
+            if not self.log_path.exists():
+                with self.log_path.open("w", newline="") as fh:
+                    csv.writer(fh).writerow(self.COLUMNS)
+
+        def log(
+            self,
+            workflow_id: str,
+            vendor_name: str,
+            call: "AgentCall",
+            sla_status: str = "UNKNOWN",
+            escalation_required: bool = False,
+        ) -> None:
+            """Append a row for this vendor agent call."""
+            row = {
+                "timestamp": call.timestamp,
+                "workflow_id": workflow_id,
+                "vendor_name": vendor_name,
+                "input_tokens": call.input_tokens,
+                "output_tokens": call.output_tokens,
+                "cache_created": call.cache_created,
+                "cache_read": call.cache_read,
+                "cost_usd": round(call.cost_usd, 6),
+                "status": call.status,
+                "sla_status": sla_status,
+                "escalation_required": escalation_required,
+            }
+            with self.log_path.open("a", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=self.COLUMNS)
+                writer.writerow(row)
+            logger.info(
+                f"VendorCostCSVLogger: logged {workflow_id} "
+                f"cost=${row['cost_usd']:.6f} sla={sla_status} "
+                f"escalation={escalation_required} → {self.log_path}"
+            )
+
     def run_vendor_agent_with_gates(self, vendor_name: str, metrics: dict) -> Tuple[str, WorkflowState]:
         """Run Vendor Agent SLA scorecard + governance layer."""
 
@@ -2645,6 +2703,26 @@ Assess performance, flag any SLA breaches, and recommend actions.""",
 
         if not output:
             raise RuntimeError(f"Vendor Agent call failed: {call.reason}")
+
+        # ── Parse scorecard fields for the CSV row ────────────────────────────
+        sla_status = "UNKNOWN"
+        escalation_required = False
+        try:
+            scorecard = json.loads(output)
+            sla_status = scorecard.get("sla_status", "UNKNOWN")
+            escalation_required = bool(scorecard.get("escalation_required", False))
+        except (json.JSONDecodeError, AttributeError):
+            pass  # Output was not JSON; leave defaults
+
+        # ── Append to cost log CSV ────────────────────────────────────────────
+        csv_logger = self.VendorCostCSVLogger()
+        csv_logger.log(
+            workflow_id=workflow_id,
+            vendor_name=vendor_name,
+            call=call,
+            sla_status=sla_status,
+            escalation_required=escalation_required,
+        )
 
         workflow_state = self.stage_gate_manager.pause_at_gate(
             workflow_id=workflow_id, agent_name="vendor_agent", project_name=vendor_name,
