@@ -47,6 +47,12 @@ try:
 except ImportError:
     REPORTLAB_AVAILABLE = False
 
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -65,6 +71,49 @@ app.config.from_object(Config)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 db = SQLAlchemy(app)
+
+# ============================================================================
+# AGENT CHAT — personas & in-memory history
+# ============================================================================
+_AGENT_CHAT_PERSONAS = {
+    "pm_agent": (
+        "You are the PM Agent for First Genesis, a specialist in project charters, "
+        "work breakdown structures, timelines, and risk management. "
+        "Active projects you manage: AURA MVP (client Malcolm Goodwin, $150K budget, "
+        "12-week timeline, silhouette technology + 3D mesh scope), "
+        "Chevron Sand Management, WWT Enhancement, and Middle East. "
+        "Respond in clear, professional language. No JSON — answer naturally and helpfully."
+    ),
+    "ba_agent": (
+        "You are the BA Agent for First Genesis, specialising in requirements extraction "
+        "from design session transcripts, traceability matrices (FR/NFR), and stakeholder "
+        "analysis. You support projects like AURA MVP. "
+        "Respond conversationally and clearly."
+    ),
+    "qa_agent": (
+        "You are the QA Agent for First Genesis. You audit deliverables before client "
+        "handoff, detect scope creep by comparing current work against original RFPs, "
+        "and assess whether projects are READY or NEED WORK. "
+        "Respond conversationally."
+    ),
+    "vendor_agent": (
+        "You are the Vendor Agent for First Genesis. You monitor vendor SLA performance, "
+        "generate weekly scorecards, and manage vendor relationships. "
+        "Current vendor: Yubi (WBT deadline April 30, 2026). "
+        "SLA targets: on-time delivery ≥95%, quality ≥90%, response time <24h, "
+        "budget variance <5%. Respond conversationally."
+    ),
+    "manager_agent": (
+        "You are the Manager Agent for First Genesis. You oversee the full project "
+        "portfolio and provide executive visibility. Portfolio: AURA MVP, "
+        "Chevron Sand Management, WWT Enhancement, Middle East. "
+        "Total portfolio budget: $2.75M. Success rate target: 94%+. "
+        "Respond conversationally."
+    ),
+}
+
+# In-memory chat histories: {socket_sid: {agent_name: [{"role": ..., "content": ...}]}}
+_chat_histories: Dict[str, Dict[str, List]] = {}
 
 # ============================================================================
 # DATABASE MODELS
@@ -407,10 +456,64 @@ def handle_connect():
 @socketio.on("disconnect")
 def handle_disconnect():
     app.logger.info(f"WebSocket disconnected: {request.sid}")
+    _chat_histories.pop(request.sid, None)
 
 @socketio.on("request_update")
 def handle_update_request(data):
     emit("dashboard_update", _build_dashboard())
+
+@socketio.on("agent_chat")
+def handle_agent_chat(data):
+    agent_name = data.get("agent_name", "pm_agent")
+    user_message = data.get("message", "").strip()
+    sid = request.sid
+
+    if not user_message or agent_name not in _AGENT_CHAT_PERSONAS:
+        return
+
+    if not ANTHROPIC_AVAILABLE:
+        emit("chat_token", {"agent_name": agent_name,
+                            "token": "[Error: anthropic package not installed. Run: pip install anthropic]"})
+        emit("chat_done", {"agent_name": agent_name})
+        return
+
+    _chat_histories.setdefault(sid, {})
+    _chat_histories[sid].setdefault(agent_name, [])
+    history = _chat_histories[sid][agent_name]
+    history.append({"role": "user", "content": user_message})
+
+    def stream_response():
+        client = anthropic.Anthropic()
+        full_response = ""
+        try:
+            with client.messages.stream(
+                model="claude-opus-4-6",
+                max_tokens=1024,
+                system=_AGENT_CHAT_PERSONAS[agent_name],
+                messages=history,
+            ) as stream:
+                for token in stream.text_stream:
+                    full_response += token
+                    socketio.emit("chat_token",
+                                  {"agent_name": agent_name, "token": token},
+                                  to=sid)
+        except Exception as e:
+            socketio.emit("chat_token",
+                          {"agent_name": agent_name, "token": f"\n\n[Error: {e}]"},
+                          to=sid)
+        finally:
+            history.append({"role": "assistant", "content": full_response})
+            socketio.emit("chat_done", {"agent_name": agent_name}, to=sid)
+
+    threading.Thread(target=stream_response, daemon=True).start()
+
+@socketio.on("clear_chat")
+def handle_clear_chat(data):
+    agent_name = data.get("agent_name")
+    sid = request.sid
+    if sid in _chat_histories and agent_name in _chat_histories[sid]:
+        _chat_histories[sid][agent_name] = []
+    emit("chat_cleared", {"agent_name": agent_name})
 
 def _push_loop():
     """Background thread — push state every 3 seconds."""

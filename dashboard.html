@@ -295,6 +295,27 @@
     .spark-bar:hover { opacity: 1; }
     .spark-lbl  { font-size: .6rem; color: #475569; white-space: nowrap; }
     .spark-cnt  { font-size: .62rem; color: #94a3b8; }
+
+  /* ── Chat view ──────────────────────────────────────────────────────────── */
+  .chat-agent-btn {
+    background: #1a1d2e; border: 1px solid #3d4268; color: #94a3b8;
+    padding: 6px 14px; border-radius: 20px; cursor: pointer; font-size: .82rem;
+    transition: all .15s;
+  }
+  .chat-agent-btn:hover { background: #1e2130; color: #e2e8f0; }
+  .chat-agent-btn.active { background: #3d2f8f; color: #a78bfa; border-color: #7c6af7; }
+  .chat-bubble {
+    max-width: 80%; padding: 10px 14px; border-radius: 12px;
+    font-size: .88rem; line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+  }
+  .chat-bubble.user  { background: #3d2f8f; color: #e2e8f0; align-self: flex-end;
+                       border-bottom-right-radius: 3px; }
+  .chat-bubble.agent { background: #1e2130; color: #cbd5e1; align-self: flex-start;
+                       border: 1px solid #2d3148; border-bottom-left-radius: 3px; }
+  .chat-bubble.agent.streaming::after { content: "▋"; animation: cblink .7s infinite; }
+  @keyframes cblink { 0%,100%{opacity:1} 50%{opacity:0} }
+  .chat-label { font-size: .7rem; color: #64748b; margin-bottom: 3px; }
+  .chat-label.user-label { text-align: right; }
   </style>
 </head>
 <body>
@@ -323,6 +344,8 @@
   <a onclick="showView('approvals')"   data-view="approvals">   <span class="icon">✅</span> Approvals</a>
   <div class="nav-section">Finance</div>
   <a onclick="showView('costs')"       data-view="costs">       <span class="icon">💰</span> Costs</a>
+  <div class="nav-section">Interact</div>
+  <a onclick="showView('chat')"        data-view="chat">        <span class="icon">🤖</span> Chat</a>
 </nav>
 
 <!-- ── Main content ────────────────────────────────────────────────────────── -->
@@ -463,6 +486,51 @@
     </div>
   </div>
 
+  <!-- CHAT ─────────────────────────────────────────────────────── -->
+  <div class="view-block" id="view-chat">
+    <div class="section-title">🤖 Chat with Agents</div>
+
+    <!-- Agent selector -->
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:16px;">
+      <button class="chat-agent-btn active" data-agent="pm_agent"     onclick="selectChatAgent('pm_agent')">PM Agent</button>
+      <button class="chat-agent-btn"        data-agent="ba_agent"     onclick="selectChatAgent('ba_agent')">BA Agent</button>
+      <button class="chat-agent-btn"        data-agent="qa_agent"     onclick="selectChatAgent('qa_agent')">QA Agent</button>
+      <button class="chat-agent-btn"        data-agent="vendor_agent" onclick="selectChatAgent('vendor_agent')">Vendor Agent</button>
+      <button class="chat-agent-btn"        data-agent="manager_agent"onclick="selectChatAgent('manager_agent')">Manager Agent</button>
+      <button onclick="clearCurrentChat()"
+              style="margin-left:auto;background:#1e2130;border:1px solid #3d4268;
+                     color:#94a3b8;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:.8rem;">
+        Clear
+      </button>
+    </div>
+
+    <!-- Message thread -->
+    <div id="chat-thread"
+         style="background:#12141f;border:1px solid #2d3148;border-radius:10px;
+                padding:16px;height:420px;overflow-y:auto;display:flex;
+                flex-direction:column;gap:10px;margin-bottom:12px;">
+      <div id="chat-empty-state"
+           style="color:#475569;font-size:.85rem;text-align:center;margin:auto;">
+        Select an agent above and start chatting.
+      </div>
+    </div>
+
+    <!-- Input row -->
+    <div style="display:flex;gap:8px;">
+      <textarea id="chat-input" rows="2"
+                placeholder="Ask the agent anything… (Enter to send, Shift+Enter for newline)"
+                onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChatMessage();}"
+                style="flex:1;background:#1a1d2e;border:1px solid #3d4268;border-radius:8px;
+                       color:#e2e8f0;padding:10px 14px;font-size:.9rem;resize:none;
+                       font-family:inherit;outline:none;"></textarea>
+      <button onclick="sendChatMessage()"
+              style="background:#7c6af7;color:#fff;border:none;border-radius:8px;
+                     padding:0 20px;font-size:.9rem;cursor:pointer;font-weight:600;">
+        Send
+      </button>
+    </div>
+  </div>
+
 </main>
 
 <!-- ── Right sidebar ───────────────────────────────────────────────────────── -->
@@ -489,11 +557,135 @@
   </div>
 </aside>
 
+<script src="/socket.io/socket.io.js"></script>
 <script>
 // ============================================================================
 // MOCK DATA — replace API_URL below with real backend when available
 // ============================================================================
 const API_URL = null;   // Set to "http://localhost:8000/api" to connect backend
+
+// ============================================================================
+// SOCKETIO — connect when backend is available
+// ============================================================================
+let socket = null;
+(function initSocket() {
+  try {
+    const base = API_URL ? API_URL.replace('/api', '') : window.location.origin;
+    if (typeof io !== 'undefined') {
+      socket = io(base, { transports: ['websocket', 'polling'] });
+      socket.on('dashboard_update', (data) => { state = data; });
+      socket.on('chat_token', ({ agent_name, token }) => {
+        if (agent_name !== chatState.activeAgent) return;
+        const bubble = document.getElementById('streaming-bubble');
+        if (bubble) bubble.textContent += token;
+        const thread = document.getElementById('chat-thread');
+        if (thread) thread.scrollTop = thread.scrollHeight;
+      });
+      socket.on('chat_done', ({ agent_name }) => {
+        chatState.streaming = false;
+        const bubble = document.getElementById('streaming-bubble');
+        if (bubble) {
+          bubble.classList.remove('streaming');
+          const text = bubble.textContent;
+          bubble.removeAttribute('id');
+          chatState.histories[agent_name] = chatState.histories[agent_name] || [];
+          chatState.histories[agent_name].push({ role: 'assistant', content: text });
+        }
+        // Re-enable input
+        const input = document.getElementById('chat-input');
+        if (input) input.disabled = false;
+      });
+      socket.on('chat_cleared', ({ agent_name }) => {
+        chatState.histories[agent_name] = [];
+        if (agent_name === chatState.activeAgent) renderChatThread();
+      });
+    }
+  } catch(e) { /* SocketIO not available — standalone mode */ }
+})();
+
+// ============================================================================
+// CHAT STATE & FUNCTIONS
+// ============================================================================
+const chatState = {
+  activeAgent: 'pm_agent',
+  streaming: false,
+  histories: {},
+  labels: {
+    pm_agent: 'PM Agent', ba_agent: 'BA Agent', qa_agent: 'QA Agent',
+    vendor_agent: 'Vendor Agent', manager_agent: 'Manager Agent'
+  }
+};
+
+function selectChatAgent(name) {
+  chatState.activeAgent = name;
+  document.querySelectorAll('.chat-agent-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.agent === name);
+  });
+  renderChatThread();
+}
+
+function renderChatThread() {
+  const thread = document.getElementById('chat-thread');
+  if (!thread) return;
+  const history = chatState.histories[chatState.activeAgent] || [];
+  if (!history.length) {
+    thread.innerHTML = '<div id="chat-empty-state" style="color:#475569;font-size:.85rem;text-align:center;margin:auto;">Select an agent above and start chatting.</div>';
+    return;
+  }
+  thread.innerHTML = history.map(turn => {
+    const isUser = turn.role === 'user';
+    const label  = isUser ? 'You' : chatState.labels[chatState.activeAgent];
+    return `<div>
+      <div class="chat-label ${isUser ? 'user-label' : ''}">${label}</div>
+      <div class="chat-bubble ${isUser ? 'user' : 'agent'}">${turn.content.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>
+    </div>`;
+  }).join('');
+  thread.scrollTop = thread.scrollHeight;
+}
+
+function sendChatMessage() {
+  if (chatState.streaming) return;
+  const input = document.getElementById('chat-input');
+  const message = (input.value || '').trim();
+  if (!message) return;
+  if (!socket || !socket.connected) {
+    alert('Not connected to backend. Start dashboard_server.py and open via http://localhost:5000/dashboard');
+    return;
+  }
+  input.value = '';
+  input.disabled = true;
+
+  // Add user bubble to local history immediately
+  chatState.histories[chatState.activeAgent] = chatState.histories[chatState.activeAgent] || [];
+  chatState.histories[chatState.activeAgent].push({ role: 'user', content: message });
+
+  // Render user bubble + empty streaming agent bubble
+  const thread = document.getElementById('chat-thread');
+  const emptyState = document.getElementById('chat-empty-state');
+  if (emptyState) emptyState.remove();
+
+  const userDiv = document.createElement('div');
+  userDiv.innerHTML = `<div class="chat-label user-label">You</div>
+    <div class="chat-bubble user">${message.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>`;
+  thread.appendChild(userDiv);
+
+  const agentDiv = document.createElement('div');
+  agentDiv.innerHTML = `<div class="chat-label">${chatState.labels[chatState.activeAgent]}</div>
+    <div class="chat-bubble agent streaming" id="streaming-bubble"></div>`;
+  thread.appendChild(agentDiv);
+  thread.scrollTop = thread.scrollHeight;
+
+  chatState.streaming = true;
+  socket.emit('agent_chat', { agent_name: chatState.activeAgent, message });
+}
+
+function clearCurrentChat() {
+  if (socket && socket.connected) {
+    socket.emit('clear_chat', { agent_name: chatState.activeAgent });
+  }
+  chatState.histories[chatState.activeAgent] = [];
+  renderChatThread();
+}
 
 // Simulated initial state — mirrors demo_dashboard() output from Python
 let state = {
@@ -914,6 +1106,7 @@ function renderView(view) {
   if (view === 'costs')      { renderCosts(); }
   if (view === 'portfolio')  { renderPortfolio(); }
   if (view === 'approvals')  { renderApprovals(); }
+  if (view === 'chat')       { if (!chatState.streaming) renderChatThread(); }
   renderAside();
 }
 
