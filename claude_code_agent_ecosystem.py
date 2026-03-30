@@ -31,6 +31,8 @@ import sys
 import uuid
 import threading
 import queue
+import csv
+import io
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, asdict
@@ -43,6 +45,12 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from enum import Enum
 
+try:
+    import openpyxl
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -53,6 +61,26 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# ENVIRONMENT CONFIGURATION
+# ============================================================================
+# Set FG_ENV=lab for lab/test mode (cheaper model, emails suppressed, relaxed budgets)
+# Set FG_ENV=production (default) for full guardrails
+FG_ENV = os.environ.get("FG_ENV", "production").lower()
+IS_LAB_MODE = FG_ENV == "lab"
+
+# Model selection: lab uses haiku (cheap), production uses opus
+ACTIVE_MODEL = "claude-haiku-4-5-20251001" if IS_LAB_MODE else "claude-opus-4-6"
+
+# Budget multiplier: lab mode has 10x relaxed caps to allow testing
+LAB_BUDGET_MULTIPLIER = 10.0 if IS_LAB_MODE else 1.0
+
+if IS_LAB_MODE:
+    logger.warning("=" * 60)
+    logger.warning("RUNNING IN LAB MODE: emails suppressed, haiku model, relaxed budgets")
+    logger.warning("Set FG_ENV=production before go-live")
+    logger.warning("=" * 60)
 
 # ============================================================================
 # CONFIGURATION: TEMPLATES
@@ -301,6 +329,9 @@ class StageGateName(Enum):
     QA_AUDIT_APPROVAL = "qa_audit_approval"
     DELIVERY_APPROVAL = "delivery_approval"
     BUDGET_ESCALATION = "budget_escalation"
+    DOCUMENT_CLEARANCE = "document_clearance"   # inbound PII review before LLM ingestion
+    LAB_SIGN_OFF = "lab_sign_off"               # required before promoting lab workflow to production
+    SME_REVIEW = "sme_review"                   # triggered when agent confidence < 3
 
 class WorkflowStatus(Enum):
     PENDING = "pending"
@@ -539,6 +570,28 @@ class WorkflowDatabase:
                 timestamp TEXT NOT NULL,
                 flag_reason TEXT NOT NULL,
                 output_snippet TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS frozen_facts (
+                fact_key TEXT PRIMARY KEY,
+                fact_value TEXT NOT NULL,
+                added_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                active INTEGER DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS bdr_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                doc_id TEXT UNIQUE NOT NULL,
+                filename TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                raw_row_count INTEGER DEFAULT 0,
+                extracted_fields TEXT,
+                redaction_map TEXT,
+                clearance_workflow_id TEXT,
+                status TEXT DEFAULT 'pending_clearance',
+                ingested_at TEXT NOT NULL,
+                cleared_at TEXT
             );
         """)
         self.conn.commit()
@@ -797,7 +850,31 @@ class StageGateManager:
             cc_emails=["emaiteu@firstgenesis.com"],
             require_comment=True,
             timeout_hours=1
-        )
+        ),
+        StageGateName.DOCUMENT_CLEARANCE: StageGate(
+            name=StageGateName.DOCUMENT_CLEARANCE,
+            description="Inbound Document PII Review Before LLM Ingestion",
+            approver_email="k.phipps@firstgenesis.com",
+            cc_emails=["emaiteu@firstgenesis.com", "tjohnson@firstgenesis.com"],
+            require_comment=True,
+            timeout_hours=4
+        ),
+        StageGateName.LAB_SIGN_OFF: StageGate(
+            name=StageGateName.LAB_SIGN_OFF,
+            description="Lab Validation Sign-Off Before Production Promotion",
+            approver_email="tjohnson@firstgenesis.com",
+            cc_emails=["pwatty@firstgenesis.com"],
+            require_comment=True,
+            timeout_hours=24
+        ),
+        StageGateName.SME_REVIEW: StageGate(
+            name=StageGateName.SME_REVIEW,
+            description="Low-Confidence Agent Output — SME Review Required",
+            approver_email="k.phipps@firstgenesis.com",
+            cc_emails=["emaiteu@firstgenesis.com"],
+            require_comment=True,
+            timeout_hours=8
+        ),
     }
 
     def __init__(self, db: WorkflowDatabase, email_gateway: EmailGateway):
@@ -910,6 +987,11 @@ class BudgetEnforcer:
             name="manager_agent", budget_per_call_usd=0.04, max_daily_calls=1,
             max_daily_spend_usd=0.10, priority=1, description="Portfolio dashboard"
         ),
+        "data_engineer_agent": AgentConfig(
+            name="data_engineer_agent", budget_per_call_usd=0.02, max_daily_calls=2,
+            max_daily_spend_usd=0.05, priority=2,
+            description="BDR ingestion, schema validation, pipeline health"
+        ),
     }
 
     def __init__(self, db: WorkflowDatabase):
@@ -973,9 +1055,14 @@ class BudgetEnforcer:
 # HALLUCINATION GUARD
 # ============================================================================
 class HallucinationGuard:
-    """Detect and prevent agent hallucinations."""
+    """Detect and prevent agent hallucinations.
 
-    FROZEN_FACTS = {
+    Frozen facts can be updated at runtime by SMEs via add_frozen_fact().
+    Updates persist in the workflow database and are loaded on init.
+    """
+
+    # Hardcoded baseline — these are always active
+    _BASE_FROZEN_FACTS = {
         "project_timeline_aura": "3 months",
         "project_client_aura": "Malcolm Goodwin",
         "daily_budget": "$5 USD",
@@ -997,6 +1084,47 @@ class HallucinationGuard:
 
     def __init__(self, db: WorkflowDatabase):
         self.db = db
+        # Merge base facts with any SME additions stored in DB
+        self.FROZEN_FACTS = dict(self._BASE_FROZEN_FACTS)
+        self._load_dynamic_facts()
+
+    def _load_dynamic_facts(self):
+        """Load SME-added facts from the database."""
+        try:
+            self.db.cursor.execute(
+                "SELECT fact_key, fact_value FROM frozen_facts WHERE active = 1"
+            )
+            for key, value in self.db.cursor.fetchall():
+                self.FROZEN_FACTS[key] = value
+        except sqlite3.OperationalError:
+            pass  # Table may not exist yet on first run
+
+    def add_frozen_fact(self, key: str, value: str, added_by: str = "sme"):
+        """SMEs can add new ground-truth facts at runtime."""
+        self.FROZEN_FACTS[key] = value
+        try:
+            self.db.cursor.execute("""
+                INSERT OR REPLACE INTO frozen_facts (fact_key, fact_value, added_by, created_at, active)
+                VALUES (?, ?, ?, ?, 1)
+            """, (key, value, added_by, datetime.now().isoformat()))
+            self.db.conn.commit()
+            logger.info(f"Frozen fact added by {added_by}: {key} = {value}")
+        except Exception as e:
+            logger.error(f"Failed to persist frozen fact: {e}")
+
+    def remove_frozen_fact(self, key: str):
+        """Deactivate a dynamic frozen fact (base facts cannot be removed)."""
+        if key in self._BASE_FROZEN_FACTS:
+            logger.warning(f"Cannot remove base frozen fact: {key}")
+            return
+        self.FROZEN_FACTS.pop(key, None)
+        try:
+            self.db.cursor.execute(
+                "UPDATE frozen_facts SET active = 0 WHERE fact_key = ?", (key,)
+            )
+            self.db.conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to deactivate frozen fact: {e}")
 
     def validate_output(self, agent_name: str, output: str) -> Tuple[bool, str]:
         output_lower = output.lower()
@@ -1026,6 +1154,92 @@ class HallucinationGuard:
         return True, "Hallucination check passed"
 
 # ============================================================================
+# PII REDACTOR
+# ============================================================================
+class PIIRedactor:
+    """Scrubs PII from inbound documents before any LLM touches them.
+
+    Uses regex patterns to replace sensitive values with typed tokens.
+    Stores a reverse map (token -> original) in SQLite so the original
+    values can be restored after human review if needed.
+
+    Usage:
+        redactor = PIIRedactor()
+        redacted_text, reverse_map = redactor.redact(raw_text)
+        # ... send redacted_text to LLM ...
+        original_text = redactor.restore(llm_output, reverse_map)
+    """
+
+    # (pattern, placeholder_prefix) — order matters: more specific first
+    PATTERNS = [
+        (r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', 'EMAIL'),
+        (r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b', 'PHONE'),
+        (r'\$[\d,]+(?:\.\d{2})?|\b\d{1,3}(?:,\d{3})+(?:\.\d{2})?\b', 'AMOUNT'),
+        (r'\b\d{3}-\d{2}-\d{4}\b', 'SSN'),
+        (r'\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|'
+         r'Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|'
+         r'Dec(?:ember)?)[.\s]+\d{1,2}[,.\s]+\d{4}\b', 'DATE'),
+        (r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', 'DATE'),
+    ]
+
+    def __init__(self):
+        self._counter = 0
+
+    def redact(self, text: str) -> Tuple[str, Dict[str, str]]:
+        """Replace PII with tokens. Returns (redacted_text, reverse_map)."""
+        reverse_map: Dict[str, str] = {}
+        redacted = text
+        for pattern, prefix in self.PATTERNS:
+            for match in re.finditer(pattern, redacted, re.IGNORECASE):
+                original = match.group(0)
+                # Reuse token if same value already seen
+                existing = next(
+                    (tok for tok, val in reverse_map.items() if val == original), None
+                )
+                if existing:
+                    continue
+                token = f"[{prefix}_{self._counter:04d}]"
+                self._counter += 1
+                reverse_map[token] = original
+                redacted = redacted.replace(original, token)
+        return redacted, reverse_map
+
+    @staticmethod
+    def restore(text: str, reverse_map: Dict[str, str]) -> str:
+        """Re-insert original values using the reverse map."""
+        for token, original in reverse_map.items():
+            text = text.replace(token, original)
+        return text
+
+    def redact_dict(self, data: dict) -> Tuple[dict, Dict[str, str]]:
+        """Recursively redact all string values in a dict."""
+        combined_map: Dict[str, str] = {}
+        result = {}
+        for key, value in data.items():
+            if isinstance(value, str):
+                redacted, rmap = self.redact(value)
+                result[key] = redacted
+                combined_map.update(rmap)
+            elif isinstance(value, dict):
+                redacted_sub, rmap = self.redact_dict(value)
+                result[key] = redacted_sub
+                combined_map.update(rmap)
+            elif isinstance(value, list):
+                new_list = []
+                for item in value:
+                    if isinstance(item, str):
+                        r, rmap = self.redact(item)
+                        new_list.append(r)
+                        combined_map.update(rmap)
+                    else:
+                        new_list.append(item)
+                result[key] = new_list
+            else:
+                result[key] = value
+        return result, combined_map
+
+
+# ============================================================================
 # AUTONOMOUS AGENT WITH EMAIL GATES + GUARDRAILS
 # ============================================================================
 class AutonomousAgentWithEmailGates:
@@ -1038,19 +1252,52 @@ class AutonomousAgentWithEmailGates:
         self.stage_gate_manager = StageGateManager(self.db, self.email_gateway)
         self.budget_enforcer = BudgetEnforcer(self.db)
         self.hallucination_guard = HallucinationGuard(self.db)
-        logger.info("Agent system initialized")
+        self.knowledge_library = KnowledgeLibrary()
+        self.pii_redactor = PIIRedactor()
+        logger.info(f"Agent system initialized (env={FG_ENV}, model={ACTIVE_MODEL})")
+
+    def _build_system_prompt_with_corrections(self, agent_name: str,
+                                               base_system_prompt: str) -> str:
+        """Inject top SME corrections as few-shot examples into the system prompt."""
+        try:
+            corrections = self.knowledge_library.get_sme_corrections(agent_name, limit=3)
+        except Exception:
+            corrections = []
+        if not corrections:
+            return base_system_prompt
+        correction_block = "\n\nSME CORRECTIONS (learn from these past mistakes):\n"
+        for i, c in enumerate(corrections, 1):
+            correction_block += (
+                f"\nExample {i} — {c['category']}:\n"
+                f"  Wrong output:   {c['original_snippet'][:150]}\n"
+                f"  Correct output: {c['corrected_content'][:150]}\n"
+            )
+        return base_system_prompt + correction_block
 
     def _call_claude(self, agent_name: str, system_prompt: str,
-                     user_message: str, workflow_id: str = None) -> Tuple[str, AgentCall]:
-        """Call Claude with budget check and hallucination validation."""
+                     user_message: str, workflow_id: str = None,
+                     scaffold_mode: bool = True) -> Tuple[str, AgentCall, int]:
+        """Call Claude with budget check, hallucination validation, and confidence scoring.
 
-        # Estimate cost
+        Args:
+            scaffold_mode: When True, instructs agent to populate templates only
+                           and never author design sections marked HUMAN_ONLY.
+        Returns:
+            (output_text, AgentCall, confidence_score 1-5)
+        """
+        # In lab mode, relax budget checks
+        budget_multiplier = LAB_BUDGET_MULTIPLIER
+
+        # Estimate cost (use actual model pricing)
         estimated_tokens = len(user_message.split()) * 1.3
-        estimated_cost = (estimated_tokens / 1_000_000) * TokenCost.INPUT_COST_PER_1M
+        input_cost_rate = 0.25 if IS_LAB_MODE else TokenCost.INPUT_COST_PER_1M
+        estimated_cost = (estimated_tokens / 1_000_000) * input_cost_rate
 
         # Budget check
-        can_proceed, budget_reason = self.budget_enforcer.can_call_agent(agent_name, estimated_cost)
-        if not can_proceed:
+        can_proceed, budget_reason = self.budget_enforcer.can_call_agent(
+            agent_name, estimated_cost / budget_multiplier
+        )
+        if not can_proceed and not IS_LAB_MODE:
             call = AgentCall(
                 agent_name=agent_name, timestamp=datetime.now().isoformat(),
                 input_tokens=0, output_tokens=0, cache_created=0, cache_read=0,
@@ -1058,14 +1305,31 @@ class AutonomousAgentWithEmailGates:
             )
             self.db.log_agent_call(call, workflow_id)
             logger.error(f"{agent_name}: Budget rejected - {budget_reason}")
-            return "", call
+            return "", call, 0
 
-        # API call
+        # Inject SME corrections into system prompt
+        enriched_system = self._build_system_prompt_with_corrections(agent_name, system_prompt)
+
+        # Scaffold mode: prevent agents from authoring HUMAN_ONLY sections
+        if scaffold_mode:
+            enriched_system += (
+                "\n\nSCAFFOLD MODE — CRITICAL RULES:\n"
+                "1. Populate template fields with EXTRACTED FACTS only.\n"
+                "2. Any field marked [HUMAN_ONLY] must be left blank — output empty string.\n"
+                "3. Add a 'confidence' field (integer 1-5) to your JSON output.\n"
+                "   1=guessing, 3=reasonable, 5=certain from source data.\n"
+                "4. If you are not certain of a value, output [NEEDS_SME_INPUT] instead.\n"
+                "5. Tag each generated sentence with [AGENT_DRAFTED] or [FACT_EXTRACTED].\n"
+            )
+        else:
+            enriched_system += "\n\nAlways include a 'confidence' field (1-5) in your JSON output."
+
+        # API call — use ACTIVE_MODEL based on environment
         try:
             response = self.client.messages.create(
-                model="claude-opus-4-6",
+                model=ACTIVE_MODEL,
                 max_tokens=2000,
-                system=system_prompt,
+                system=enriched_system,
                 messages=[{"role": "user", "content": user_message}]
             )
         except Exception as e:
@@ -1076,7 +1340,7 @@ class AutonomousAgentWithEmailGates:
             )
             self.db.log_agent_call(call, workflow_id)
             logger.error(f"{agent_name}: API error - {str(e)}")
-            return "", call
+            return "", call, 0
 
         output = response.content[0].text
         output_hash = hashlib.sha256(output.encode()).hexdigest()
@@ -1086,6 +1350,18 @@ class AutonomousAgentWithEmailGates:
             cache_creation_tokens=getattr(response.usage, 'cache_creation_input_tokens', 0),
             cache_read_tokens=getattr(response.usage, 'cache_read_input_tokens', 0)
         ).total_cost_usd()
+
+        # Extract confidence score from JSON output
+        confidence = 5  # default high if no score provided
+        try:
+            parsed = json.loads(output)
+            confidence = int(parsed.get("confidence", 5))
+            confidence = max(1, min(5, confidence))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            # Non-JSON response — attempt regex extraction
+            m = re.search(r'"confidence"\s*:\s*(\d)', output)
+            if m:
+                confidence = max(1, min(5, int(m.group(1))))
 
         # Hallucination check
         is_valid, hall_reason = self.hallucination_guard.validate_output(agent_name, output)
@@ -1101,7 +1377,7 @@ class AutonomousAgentWithEmailGates:
             )
             self.db.log_agent_call(call, workflow_id)
             logger.error(f"{agent_name}: Hallucination detected - {hall_reason}")
-            return "", call
+            return "", call, 0
 
         call = AgentCall(
             agent_name=agent_name, timestamp=datetime.now().isoformat(),
@@ -1112,35 +1388,87 @@ class AutonomousAgentWithEmailGates:
             cost_usd=cost, status="success", reason="", output_hash=output_hash
         )
         self.db.log_agent_call(call, workflow_id)
-        logger.info(f"{agent_name}: Success - {call}")
-        return output, call
+        logger.info(f"{agent_name}: Success (confidence={confidence}) - {call}")
+        return output, call, confidence
 
     def run_pm_agent_with_gates(self, project_metadata: dict) -> Tuple[str, WorkflowState]:
-        """Run PM Agent with guardrails + charter approval gate."""
+        """Run PM Agent with guardrails + charter approval gate.
 
-        workflow_id = f"pm_{project_metadata['project']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        Uses scaffold mode: agent fills in known facts only.
+        Low-confidence output (<3) automatically routes to SME_REVIEW gate
+        before proceeding to CHARTER_APPROVAL.
+        """
+        workflow_id = f"pm_{project_metadata.get('project','proj')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         project_name = project_metadata.get('project', 'Unknown')
         logger.info(f"Starting PM Agent workflow: {workflow_id}")
 
-        output, call = self._call_claude(
+        # In lab mode, mark workflow for lab sign-off before production promotion
+        env_tag = "[LAB]" if IS_LAB_MODE else "[PROD]"
+
+        output, call, confidence = self._call_claude(
             agent_name="pm_agent",
-            system_prompt="You are a Project Manager Agent for First Genesis. Output ONLY valid JSON. NO explanations, NO preamble.",
-            user_message=f"""Generate project charter for:
+            system_prompt=(
+                "You are a Project Manager Agent for First Genesis. "
+                "Output ONLY valid JSON. NO explanations, NO preamble. "
+                "You ASSIST human architects — do NOT make design decisions."
+            ),
+            user_message=f"""Populate the project charter template with EXTRACTED FACTS only.
+Project metadata:
 {json.dumps(project_metadata, indent=2)}
-Output as JSON only:
-{{"project_charter": {{"title": "...", "client": "...", "timeline": "3 months"}}, "wbs": {{}}, "risks": []}}""",
-            workflow_id=workflow_id
+
+Output JSON only — fill each field from the source data above.
+Mark any field you cannot determine from the data as "[NEEDS_SME_INPUT]".
+Sections marked [HUMAN_ONLY] must be empty strings.
+
+{{"project_charter": {{
+  "title": "...",
+  "client": "...",
+  "timeline": "3 months",
+  "scope": "...",
+  "success_criteria": "[HUMAN_ONLY]",
+  "technical_architecture": "[HUMAN_ONLY]",
+  "integration_strategy": "[HUMAN_ONLY]"
+}},
+"wbs": {{}},
+"risks": [],
+"confidence": 4,
+"env": "{env_tag}"
+}}""",
+            workflow_id=workflow_id,
+            scaffold_mode=True
         )
 
         if not output:
             raise RuntimeError(f"PM Agent call failed: {call.reason}")
 
-        workflow_state = self.stage_gate_manager.pause_at_gate(
-            workflow_id=workflow_id, agent_name="pm_agent", project_name=project_name,
-            stage_gate_name=StageGateName.CHARTER_APPROVAL,
-            content_pending_approval=output
+        # Confidence < 3: route to SME review before charter approval
+        if confidence < 3:
+            logger.warning(
+                f"PM Agent low confidence ({confidence}/5) — routing to SME_REVIEW gate"
+            )
+            workflow_state = self.stage_gate_manager.pause_at_gate(
+                workflow_id=workflow_id, agent_name="pm_agent", project_name=project_name,
+                stage_gate_name=StageGateName.SME_REVIEW,
+                content_pending_approval=f"[confidence={confidence}/5]\n{output}"
+            )
+        elif IS_LAB_MODE:
+            # Lab workflows go to LAB_SIGN_OFF before charter approval
+            workflow_state = self.stage_gate_manager.pause_at_gate(
+                workflow_id=workflow_id, agent_name="pm_agent", project_name=project_name,
+                stage_gate_name=StageGateName.LAB_SIGN_OFF,
+                content_pending_approval=output
+            )
+        else:
+            workflow_state = self.stage_gate_manager.pause_at_gate(
+                workflow_id=workflow_id, agent_name="pm_agent", project_name=project_name,
+                stage_gate_name=StageGateName.CHARTER_APPROVAL,
+                content_pending_approval=output
+            )
+
+        logger.info(
+            f"Workflow {workflow_id} paused at {workflow_state.current_stage_gate.value} "
+            f"(confidence={confidence}/5)"
         )
-        logger.info(f"Workflow {workflow_id} paused at {workflow_state.current_stage_gate.value}")
         return output, workflow_state
 
     def resume_approved_workflow(self, workflow_id: str) -> str:
@@ -1185,6 +1513,198 @@ Output as JSON only:
                 f"  Approver:  {approver_email}\n"
                 f"  Feedback:  {feedback or 'None'}\n\n"
                 f"Workflow status updated to: {workflow_state.status.value}\n")
+
+    def submit_sme_correction(self, agent_name: str, original_output_hash: str,
+                              original_snippet: str, corrected_content: str,
+                              correction_category: str, corrector_name: str,
+                              weight: int = 1) -> str:
+        """Record an SME correction for an agent output.
+        The correction will be injected as a few-shot example in that agent's
+        future system prompts, shaping its behaviour without retraining.
+        """
+        correction_id = self.knowledge_library.save_sme_correction(
+            agent_name=agent_name,
+            original_output_hash=original_output_hash,
+            original_snippet=original_snippet,
+            corrected_content=corrected_content,
+            correction_category=correction_category,
+            corrector_name=corrector_name,
+            weight=weight
+        )
+        return (f"\nSME correction recorded:\n"
+                f"  Correction ID: {correction_id}\n"
+                f"  Agent:         {agent_name}\n"
+                f"  Category:      {correction_category}\n"
+                f"  Corrector:     {corrector_name}\n"
+                f"  Weight:        {weight}\n"
+                f"This correction will auto-inject into future {agent_name} calls.\n")
+
+    def run_bdr_intake_agent(self, filepath: str) -> Tuple[str, WorkflowState]:
+        """Ingest a BDR document (CSV or Excel) through the full pipeline.
+
+        Pipeline:
+        1. Parse file (CSV via stdlib, xlsx via openpyxl if available)
+        2. Run PII redaction on all string fields
+        3. Pause at DOCUMENT_CLEARANCE gate for human PII review
+        4. After clearance: use DataEngineerAgent to extract structured summary
+        5. Store parsed doc in bdr_documents table
+        Returns (structured_json, WorkflowState)
+        """
+        doc_id = f"bdr_{uuid.uuid4().hex[:12]}"
+        workflow_id = f"intake_{doc_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        filename = os.path.basename(filepath)
+        file_ext = os.path.splitext(filename)[1].lower()
+
+        logger.info(f"BDR intake started: {filename} (doc_id={doc_id})")
+
+        # Step 1: Parse file into raw rows
+        raw_rows: List[Dict] = []
+        try:
+            if file_ext == ".csv":
+                with open(filepath, "r", encoding="utf-8-sig") as f:
+                    reader = csv.DictReader(f)
+                    raw_rows = [dict(row) for row in reader]
+            elif file_ext in (".xlsx", ".xls"):
+                if not OPENPYXL_AVAILABLE:
+                    raise RuntimeError(
+                        "openpyxl not installed. Run: pip install openpyxl"
+                    )
+                wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+                ws = wb.active
+                headers = [str(cell.value) for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    raw_rows.append(dict(zip(headers, [str(v) if v is not None else "" for v in row])))
+                wb.close()
+            else:
+                raise ValueError(f"Unsupported file type: {file_ext}. Supported: .csv, .xlsx")
+        except Exception as e:
+            logger.error(f"BDR parse failed for {filename}: {e}")
+            raise
+
+        logger.info(f"Parsed {len(raw_rows)} rows from {filename}")
+
+        # Step 2: PII redaction on all string fields
+        redacted_rows = []
+        combined_reverse_map: Dict[str, str] = {}
+        for row in raw_rows:
+            redacted_row, rmap = self.pii_redactor.redact_dict(row)
+            redacted_rows.append(redacted_row)
+            combined_reverse_map.update(rmap)
+
+        redaction_summary = (
+            f"Redacted {len(combined_reverse_map)} PII tokens across {len(raw_rows)} rows.\n"
+            f"Token types: {', '.join(set(k.split('_')[0][1:] for k in combined_reverse_map.keys()))}\n"
+            f"Sample (first row, redacted): {json.dumps(redacted_rows[0] if redacted_rows else {})}"
+        )
+        logger.info(f"PII redaction complete: {len(combined_reverse_map)} tokens replaced")
+
+        # Persist to DB (pre-clearance)
+        self.db.cursor.execute("""
+            INSERT OR REPLACE INTO bdr_documents
+            (doc_id, filename, file_type, raw_row_count, extracted_fields,
+             redaction_map, clearance_workflow_id, status, ingested_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_clearance', ?)
+        """, (
+            doc_id, filename, file_ext,
+            len(raw_rows),
+            json.dumps(redacted_rows[:5]),   # store sample only
+            json.dumps(combined_reverse_map),
+            workflow_id,
+            datetime.now().isoformat()
+        ))
+        self.db.conn.commit()
+
+        # Step 3: Pause for human DOCUMENT_CLEARANCE review
+        clearance_content = (
+            f"BDR Document: {filename}\n"
+            f"Rows: {len(raw_rows)}\n"
+            f"PII Summary: {redaction_summary}\n\n"
+            f"Please review the redacted sample above and approve for LLM ingestion.\n"
+            f"Approve = data cleared for agent analysis.\n"
+            f"Reject = document held, no LLM contact.\n"
+        )
+        workflow_state = self.stage_gate_manager.pause_at_gate(
+            workflow_id=workflow_id,
+            agent_name="data_engineer_agent",
+            project_name=filename,
+            stage_gate_name=StageGateName.DOCUMENT_CLEARANCE,
+            content_pending_approval=clearance_content
+        )
+
+        logger.info(
+            f"BDR intake paused at DOCUMENT_CLEARANCE for {filename}. "
+            f"Awaiting human approval (workflow_id={workflow_id})"
+        )
+        return json.dumps({
+            "doc_id": doc_id,
+            "workflow_id": workflow_id,
+            "filename": filename,
+            "row_count": len(raw_rows),
+            "pii_tokens_redacted": len(combined_reverse_map),
+            "status": "pending_clearance",
+            "message": "Document queued for human PII review before LLM ingestion"
+        }, indent=2), workflow_state
+
+    def complete_bdr_analysis(self, doc_id: str) -> str:
+        """Run DataEngineerAgent analysis after DOCUMENT_CLEARANCE is approved.
+
+        Call this after the DOCUMENT_CLEARANCE approval is processed.
+        Sends the redacted BDR data to Claude for structured extraction.
+        """
+        self.db.cursor.execute(
+            "SELECT * FROM bdr_documents WHERE doc_id = ?", (doc_id,)
+        )
+        row = self.db.cursor.fetchone()
+        if not row:
+            return f"ERROR: Document {doc_id} not found"
+
+        doc_id_, filename, file_type, row_count, extracted_fields, \
+            redaction_map, clearance_wf_id, status, ingested_at, cleared_at = row
+
+        if status == "pending_clearance":
+            return f"ERROR: Document {doc_id} not yet cleared. Awaiting DOCUMENT_CLEARANCE approval."
+
+        redacted_sample = json.loads(extracted_fields or "[]")
+        workflow_id = f"bdr_analysis_{doc_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        output, call, confidence = self._call_claude(
+            agent_name="data_engineer_agent",
+            system_prompt=(
+                "You are a Data Engineer Agent for First Genesis. "
+                "Extract and normalize structured data from BDR documents. "
+                "Output ONLY valid JSON. Identify field types, data quality issues, "
+                "and flag any fields requiring SME review."
+            ),
+            user_message=f"""Analyze this BDR document sample and extract structured schema.
+Filename: {filename}
+Row count: {row_count}
+Redacted sample rows: {json.dumps(redacted_sample, indent=2)}
+
+Output JSON only:
+{{
+  "schema": {{"field_name": "inferred_type", ...}},
+  "data_quality": {{"issues": [], "completeness_pct": 95}},
+  "sme_review_fields": ["field1"],
+  "extraction_summary": "...",
+  "confidence": 4
+}}""",
+            workflow_id=workflow_id,
+            scaffold_mode=False
+        )
+
+        if not output:
+            return f"ERROR: DataEngineerAgent call failed: {call.reason}"
+
+        # Mark document as analyzed
+        self.db.cursor.execute(
+            "UPDATE bdr_documents SET status = 'analyzed', cleared_at = ? WHERE doc_id = ?",
+            (datetime.now().isoformat(), doc_id)
+        )
+        self.db.conn.commit()
+
+        return output
+
+
 
 # ============================================================================
 # DASHBOARD: KNOWLEDGE LIBRARY
@@ -1241,6 +1761,19 @@ class KnowledgeLibrary:
                 content TEXT,
                 timestamp TEXT,
                 status TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS sme_corrections (
+                correction_id TEXT PRIMARY KEY,
+                agent_name TEXT NOT NULL,
+                original_output_hash TEXT NOT NULL,
+                original_snippet TEXT NOT NULL,
+                corrected_content TEXT NOT NULL,
+                correction_category TEXT NOT NULL,
+                corrector_name TEXT NOT NULL,
+                weight INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                usage_count INTEGER DEFAULT 0
             );
         """)
         self.conn.commit()
@@ -1317,7 +1850,57 @@ class KnowledgeLibrary:
         ))
         self.conn.commit()
 
-    def get_lessons_learned(self, category: Optional[str] = None) -> List[Dict]:
+    # ── SME Corrections ───────────────────────────────────────────────────────
+
+    def save_sme_correction(self, agent_name: str, original_output_hash: str,
+                            original_snippet: str, corrected_content: str,
+                            correction_category: str, corrector_name: str,
+                            weight: int = 1):
+        """Store an SME correction to inject as a few-shot example in future calls."""
+        correction_id = str(uuid.uuid4())
+        self.conn.execute("""
+            INSERT INTO sme_corrections
+            (correction_id, agent_name, original_output_hash, original_snippet,
+             corrected_content, correction_category, corrector_name, weight, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            correction_id, agent_name, original_output_hash,
+            original_snippet[:500], corrected_content[:1000],
+            correction_category, corrector_name, weight,
+            datetime.now().isoformat()
+        ))
+        self.conn.commit()
+        logger.info(f"SME correction saved for {agent_name} by {corrector_name}")
+        return correction_id
+
+    def get_sme_corrections(self, agent_name: str, limit: int = 3) -> List[Dict]:
+        """Retrieve top-weighted corrections for an agent to inject into prompts."""
+        cursor = self.conn.execute("""
+            SELECT correction_id, agent_name, original_snippet, corrected_content,
+                   correction_category, corrector_name, weight, usage_count, created_at
+            FROM sme_corrections
+            WHERE agent_name = ?
+            ORDER BY weight DESC, usage_count ASC
+            LIMIT ?
+        """, (agent_name, limit))
+        corrections = []
+        for row in cursor.fetchall():
+            corrections.append({
+                "correction_id": row[0], "agent_name": row[1],
+                "original_snippet": row[2], "corrected_content": row[3],
+                "category": row[4], "corrector_name": row[5],
+                "weight": row[6], "usage_count": row[7], "created_at": row[8]
+            })
+        if corrections:
+            ids = [c["correction_id"] for c in corrections]
+            self.conn.execute(
+                f"UPDATE sme_corrections SET usage_count = usage_count + 1 "
+                f"WHERE correction_id IN ({','.join('?'*len(ids))})", ids
+            )
+            self.conn.commit()
+        return corrections
+
+    def get_lessons_learned(self, category: Optional[str] = None) -> List[Dict]:  # type: ignore[override]
         if category:
             cursor = self.conn.execute(
                 "SELECT * FROM lessons_learned WHERE category = ? ORDER BY created_at DESC",
@@ -1336,6 +1919,112 @@ class KnowledgeLibrary:
                 "usage_count": row[7]
             })
         return lessons
+
+
+# ============================================================================
+# DATA ENGINEER AGENT (6th agent — bridges data engineering resource gap)
+# ============================================================================
+class DataEngineerAgent:
+    """Standalone Data Engineer Agent for pipeline health, schema validation,
+    and missing data dependency detection.
+
+    This is the 6th agent in the ecosystem, bridging the resource gap identified
+    in the meeting. It does NOT replace a human data engineer but handles:
+    - Schema drift detection
+    - Pipeline health checks
+    - Data dependency alerts via the AgentCommunicationBus
+    - BDR document queue management
+    """
+
+    def __init__(self, db: WorkflowDatabase, knowledge_library: KnowledgeLibrary,
+                 comm_bus=None):
+        self.db = db
+        self.knowledge_library = knowledge_library
+        self.comm_bus = comm_bus  # Optional AgentCommunicationBus
+
+    def check_pipeline_health(self) -> Dict:
+        """Inspect the bdr_documents table for stale/blocked documents."""
+        self.db.cursor.execute("""
+            SELECT status, COUNT(*) as cnt, MAX(ingested_at) as latest
+            FROM bdr_documents GROUP BY status
+        """)
+        rows = self.db.cursor.fetchall()
+        health = {
+            "checked_at": datetime.now().isoformat(),
+            "by_status": {r[0]: {"count": r[1], "latest": r[2]} for r in rows},
+            "alerts": []
+        }
+
+        # Flag documents stuck in pending_clearance > 4 hours
+        self.db.cursor.execute("""
+            SELECT doc_id, filename, ingested_at FROM bdr_documents
+            WHERE status = 'pending_clearance'
+        """)
+        for doc_id, filename, ingested_at in self.db.cursor.fetchall():
+            try:
+                age_hours = (datetime.now() - datetime.fromisoformat(ingested_at)).total_seconds() / 3600
+                if age_hours > 4:
+                    alert = {
+                        "type": "DATA_DEPENDENCY_MISSING",
+                        "severity": "high",
+                        "doc_id": doc_id,
+                        "filename": filename,
+                        "message": f"BDR document '{filename}' stuck in clearance for {age_hours:.1f}h"
+                    }
+                    health["alerts"].append(alert)
+                    logger.warning(f"DataEngineerAgent: {alert['message']}")
+                    # Broadcast to Manager Agent via comm bus if available
+                    if self.comm_bus:
+                        self.comm_bus.send_message(
+                            from_agent="data_engineer_agent",
+                            to_agent="manager_agent",
+                            message_type=MessageType.ESCALATE,
+                            content=alert
+                        )
+            except (ValueError, TypeError):
+                pass
+
+        return health
+
+    def validate_schema(self, data: Dict, expected_fields: List[str]) -> Dict:
+        """Validate that required fields are present and non-empty."""
+        missing = [f for f in expected_fields if f not in data or not data[f]]
+        unexpected = [k for k in data if k not in expected_fields]
+        result = {
+            "valid": len(missing) == 0,
+            "missing_fields": missing,
+            "unexpected_fields": unexpected,
+            "completeness_pct": round(
+                (len(expected_fields) - len(missing)) / len(expected_fields) * 100, 1
+            ) if expected_fields else 100.0
+        }
+        if missing:
+            logger.warning(f"Schema validation: missing fields {missing}")
+        return result
+
+    def get_bdr_queue_summary(self) -> str:
+        """Return a human-readable BDR document queue summary."""
+        health = self.check_pipeline_health()
+        by_status = health["by_status"]
+        alerts = health["alerts"]
+
+        lines = [
+            "\n" + "=" * 70,
+            "DATA ENGINEER AGENT — BDR QUEUE STATUS",
+            "=" * 70,
+        ]
+        for status, info in by_status.items():
+            lines.append(f"  {status:30} {info['count']:>4} docs  (latest: {info['latest']})")
+
+        if alerts:
+            lines.append(f"\nALERTS ({len(alerts)}):")
+            for a in alerts:
+                lines.append(f"  [{a['severity'].upper()}] {a['message']}")
+        else:
+            lines.append("\nNo alerts — pipeline healthy.")
+
+        lines.append("=" * 70 + "\n")
+        return "\n".join(lines)
 
 
 # ============================================================================
@@ -1688,13 +2377,14 @@ class TokenPricing:
 class AgentCostModel:
     """Realistic token costs for each agent type."""
 
-    PM_AGENT     = {"name": "PM Agent",      "input_tokens": 3500, "output_tokens": 1200, "calls_per_day": 2, "description": "Project setup, WBS, status tracking"}
-    BA_AGENT     = {"name": "BA Agent",      "input_tokens": 6000, "output_tokens": 1500, "calls_per_day": 1, "description": "Design sessions, requirements, traceability"}
-    QA_AGENT     = {"name": "QA Agent",      "input_tokens": 8000, "output_tokens": 2000, "calls_per_day": 1, "description": "Pre-delivery audit, scope creep detection"}
-    VENDOR_AGENT = {"name": "Vendor Agent",  "input_tokens": 4000, "output_tokens":  800, "calls_per_day": 1, "description": "Partner SLA tracking, performance monitoring"}
-    MANAGER_AGENT= {"name": "Manager Agent", "input_tokens": 5000, "output_tokens": 1500, "calls_per_day": 1, "description": "Portfolio dashboard, orchestration"}
+    PM_AGENT     = {"name": "PM Agent",           "input_tokens": 3500, "output_tokens": 1200, "calls_per_day": 2, "description": "Project setup, WBS, status tracking"}
+    BA_AGENT     = {"name": "BA Agent",           "input_tokens": 6000, "output_tokens": 1500, "calls_per_day": 1, "description": "Design sessions, requirements, traceability"}
+    QA_AGENT     = {"name": "QA Agent",           "input_tokens": 8000, "output_tokens": 2000, "calls_per_day": 1, "description": "Pre-delivery audit, scope creep detection"}
+    VENDOR_AGENT = {"name": "Vendor Agent",       "input_tokens": 4000, "output_tokens":  800, "calls_per_day": 1, "description": "Partner SLA tracking, performance monitoring"}
+    MANAGER_AGENT= {"name": "Manager Agent",      "input_tokens": 5000, "output_tokens": 1500, "calls_per_day": 1, "description": "Portfolio dashboard, orchestration"}
+    DATA_ENGINEER= {"name": "Data Engineer Agent","input_tokens": 4500, "output_tokens":  900, "calls_per_day": 2, "description": "BDR ingestion, schema validation, pipeline health"}
 
-    ALL_AGENTS = [PM_AGENT, BA_AGENT, QA_AGENT, VENDOR_AGENT, MANAGER_AGENT]
+    ALL_AGENTS = [PM_AGENT, BA_AGENT, QA_AGENT, VENDOR_AGENT, MANAGER_AGENT, DATA_ENGINEER]
 
     @staticmethod
     def cost_per_agent(agent: dict) -> float:
@@ -1947,7 +2637,7 @@ def main():
     if len(sys.argv) < 2:
         print("Usage: python claude_code_agent_ecosystem.py [command]")
         print("\nAgent Commands:")
-        print("  run_pm_agent              Run PM Agent with approval gate")
+        print("  run_pm_agent              Run PM Agent with approval gate (scaffold mode)")
         print("  check_approvals           Show pending approvals")
         print("  resume_workflows          Resume approved workflows")
         print("  process_approval          Process approval response")
@@ -1957,9 +2647,33 @@ def main():
         print("    --feedback <comment>")
         print("  budget_status             Show live budget usage report")
         print("  audit_hallucinations      Show recent hallucination flags")
+        print("\nBDR Ingestion Commands:")
+        print("  run_bdr_intake            Ingest a BDR document (CSV/Excel)")
+        print("    --file <path>           Path to CSV or xlsx file")
+        print("  bdr_queue                 Show BDR document queue status")
+        print("  complete_bdr_analysis     Run analysis after clearance approval")
+        print("    --doc-id <id>")
+        print("\nSME & Guardrail Commands:")
+        print("  add_correction            Record an SME correction for an agent")
+        print("    --agent <name>          Agent name (pm_agent, ba_agent, etc.)")
+        print("    --hash <output_hash>    Hash of the original output")
+        print("    --snippet <text>        Snippet of wrong output")
+        print("    --correction <text>     What the correct output should be")
+        print("    --category <text>       Correction category")
+        print("    --corrector <name>      SME name making the correction")
+        print("    --weight <1-5>          Importance weight (default: 1)")
+        print("  list_corrections          Show SME corrections for an agent")
+        print("    --agent <name>")
+        print("  add_frozen_fact           Add a new ground-truth fact")
+        print("    --key <fact_key>")
+        print("    --value <fact_value>")
+        print("    --added-by <name>")
+        print("\nEnvironment Commands:")
+        print("  env_status                Show current environment (lab/production)")
+        print("                            Set FG_ENV=lab to switch to lab mode")
         print("\nToken Strategy Commands:")
         print("  show_budget_model         Daily budget allocation")
-        print("  show_cost_breakdown       Per-agent cost breakdown")
+        print("  show_cost_breakdown       Per-agent cost breakdown (incl. Data Engineer)")
         print("  show_optimization_impact  Technique savings analysis")
         print("  project_monthly_cost      Monthly cost scenarios")
         print("  show_executive_summary    Complete executive summary")
@@ -2068,6 +2782,116 @@ def main():
                 print(f"  Reason:  {reason}")
                 if snippet:
                     print(f"  Snippet: {snippet[:80]}...")
+
+    elif command == "run_bdr_intake":
+        kwargs = {}
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--file" and i + 1 < len(sys.argv):
+                kwargs['filepath'] = sys.argv[i + 1]; i += 2
+            else:
+                i += 1
+        if 'filepath' not in kwargs:
+            print("ERROR: --file <path> required")
+            sys.exit(1)
+        result, workflow_state = agent.run_bdr_intake_agent(**kwargs)
+        print("\n" + "=" * 70)
+        print("BDR INTAKE RESULT")
+        print("=" * 70)
+        print(result)
+        print(f"\nWorkflow: {workflow_state.workflow_id}")
+        print(f"Gate:     {workflow_state.current_stage_gate.value}")
+        print(f"Status:   {workflow_state.status.value}")
+
+    elif command == "bdr_queue":
+        de = DataEngineerAgent(agent.db, agent.knowledge_library)
+        print(de.get_bdr_queue_summary())
+
+    elif command == "complete_bdr_analysis":
+        kwargs = {}
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--doc-id" and i + 1 < len(sys.argv):
+                kwargs['doc_id'] = sys.argv[i + 1]; i += 2
+            else:
+                i += 1
+        if 'doc_id' not in kwargs:
+            print("ERROR: --doc-id required")
+            sys.exit(1)
+        result = agent.complete_bdr_analysis(**kwargs)
+        print("\nBDR Analysis Result:")
+        print(result)
+
+    elif command == "add_correction":
+        kwargs = {}
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--agent"      and i + 1 < len(sys.argv): kwargs['agent_name']         = sys.argv[i+1]; i += 2
+            elif sys.argv[i] == "--hash"     and i + 1 < len(sys.argv): kwargs['original_output_hash']= sys.argv[i+1]; i += 2
+            elif sys.argv[i] == "--snippet"  and i + 1 < len(sys.argv): kwargs['original_snippet']    = sys.argv[i+1]; i += 2
+            elif sys.argv[i] == "--correction"and i+1 < len(sys.argv):  kwargs['corrected_content']   = sys.argv[i+1]; i += 2
+            elif sys.argv[i] == "--category" and i + 1 < len(sys.argv): kwargs['correction_category'] = sys.argv[i+1]; i += 2
+            elif sys.argv[i] == "--corrector"and i + 1 < len(sys.argv): kwargs['corrector_name']      = sys.argv[i+1]; i += 2
+            elif sys.argv[i] == "--weight"   and i + 1 < len(sys.argv): kwargs['weight']              = int(sys.argv[i+1]); i += 2
+            else: i += 1
+        required = ['agent_name', 'original_output_hash', 'original_snippet',
+                    'corrected_content', 'correction_category', 'corrector_name']
+        missing = [r for r in required if r not in kwargs]
+        if missing:
+            print(f"ERROR: Missing required args: {missing}")
+            sys.exit(1)
+        print(agent.submit_sme_correction(**kwargs))
+
+    elif command == "list_corrections":
+        kwargs = {}
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--agent" and i + 1 < len(sys.argv):
+                kwargs['agent_name'] = sys.argv[i + 1]; i += 2
+            else:
+                i += 1
+        if 'agent_name' not in kwargs:
+            print("ERROR: --agent <name> required")
+            sys.exit(1)
+        corrections = agent.knowledge_library.get_sme_corrections(kwargs['agent_name'], limit=20)
+        print(f"\n{'='*70}\nSME CORRECTIONS for {kwargs['agent_name']} ({len(corrections)})\n{'='*70}")
+        if not corrections:
+            print("No corrections recorded yet.")
+        for c in corrections:
+            print(f"\n[{c['correction_id'][:8]}] {c['category']} — weight={c['weight']} "
+                  f"used={c['usage_count']}x by {c['corrector_name']}")
+            print(f"  Wrong:   {c['original_snippet'][:80]}")
+            print(f"  Correct: {c['corrected_content'][:80]}")
+
+    elif command == "add_frozen_fact":
+        kwargs = {}
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--key"      and i + 1 < len(sys.argv): kwargs['key']      = sys.argv[i+1]; i += 2
+            elif sys.argv[i] == "--value"  and i + 1 < len(sys.argv): kwargs['value']    = sys.argv[i+1]; i += 2
+            elif sys.argv[i] == "--added-by"and i+1 < len(sys.argv):  kwargs['added_by'] = sys.argv[i+1]; i += 2
+            else: i += 1
+        if not all(k in kwargs for k in ('key', 'value', 'added_by')):
+            print("ERROR: --key, --value, --added-by all required")
+            sys.exit(1)
+        agent.hallucination_guard.add_frozen_fact(**kwargs)
+        print(f"\nFrozen fact added: {kwargs['key']} = {kwargs['value']} (by {kwargs['added_by']})")
+        print(f"Active facts: {len(agent.hallucination_guard.FROZEN_FACTS)}")
+
+    elif command == "env_status":
+        print(f"\n{'='*70}")
+        print(f"ENVIRONMENT STATUS")
+        print(f"{'='*70}")
+        print(f"  FG_ENV:          {FG_ENV}")
+        print(f"  IS_LAB_MODE:     {IS_LAB_MODE}")
+        print(f"  ACTIVE_MODEL:    {ACTIVE_MODEL}")
+        print(f"  Budget Multiplier: {LAB_BUDGET_MULTIPLIER}x")
+        if IS_LAB_MODE:
+            print(f"\n  [LAB] Emails suppressed, haiku model, relaxed budgets")
+            print(f"  Set FG_ENV=production before go-live")
+        else:
+            print(f"\n  [PRODUCTION] Full guardrails active")
+        print(f"{'='*70}\n")
 
     else:
         print(f"Unknown command: {command}")

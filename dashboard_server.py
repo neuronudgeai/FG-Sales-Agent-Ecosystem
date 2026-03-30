@@ -630,6 +630,179 @@ def api_audit_log():
     ]})
 
 # ============================================================================
+# SME CORRECTIONS API
+# ============================================================================
+@app.route("/api/corrections", methods=["POST"])
+def api_add_correction():
+    """Record an SME correction for an agent output.
+    Body: {agent_name, original_output_hash, original_snippet,
+           corrected_content, correction_category, corrector_name, weight (opt)}
+    """
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.dirname(__file__))
+        from claude_code_agent_ecosystem import KnowledgeLibrary
+        data = request.get_json(force=True)
+        required = ["agent_name", "original_output_hash", "original_snippet",
+                    "corrected_content", "correction_category", "corrector_name"]
+        missing = [k for k in required if not data.get(k)]
+        if missing:
+            return jsonify({"error": f"Missing fields: {missing}"}), 400
+
+        lib = KnowledgeLibrary()
+        correction_id = lib.save_sme_correction(
+            agent_name=data["agent_name"],
+            original_output_hash=data["original_output_hash"],
+            original_snippet=data["original_snippet"],
+            corrected_content=data["corrected_content"],
+            correction_category=data["correction_category"],
+            corrector_name=data["corrector_name"],
+            weight=int(data.get("weight", 1))
+        )
+        AuditTrail.log_change("create", "sme_correction", correction_id,
+                              data["corrector_name"], {"agent": data["agent_name"]})
+        return jsonify({"correction_id": correction_id, "status": "saved"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/corrections/<agent_name>")
+def api_get_corrections(agent_name: str):
+    """Retrieve SME corrections for a given agent."""
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.dirname(__file__))
+        from claude_code_agent_ecosystem import KnowledgeLibrary
+        limit = int(request.args.get("limit", 20))
+        lib = KnowledgeLibrary()
+        corrections = lib.get_sme_corrections(agent_name, limit=limit)
+        return jsonify({"agent": agent_name, "corrections": corrections, "count": len(corrections)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================================
+# FROZEN FACTS ADMIN API
+# ============================================================================
+@app.route("/api/frozen-facts", methods=["GET"])
+def api_get_frozen_facts():
+    """Return all active frozen facts (base + SME-added)."""
+    try:
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect("/home/claude/fg_workflows.db")
+        cursor = conn.execute(
+            "SELECT fact_key, fact_value, added_by, created_at FROM frozen_facts WHERE active = 1"
+        )
+        dynamic = [{"key": r[0], "value": r[1], "added_by": r[2], "created_at": r[3]}
+                   for r in cursor.fetchall()]
+        conn.close()
+
+        from claude_code_agent_ecosystem import HallucinationGuard
+        base_facts = [{"key": k, "value": v, "added_by": "system", "created_at": None}
+                      for k, v in HallucinationGuard._BASE_FROZEN_FACTS.items()]
+        return jsonify({"base_facts": base_facts, "dynamic_facts": dynamic,
+                        "total": len(base_facts) + len(dynamic)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/frozen-facts", methods=["POST"])
+def api_add_frozen_fact():
+    """Add a new SME-supplied frozen fact.
+    Body: {key, value, added_by}
+    """
+    try:
+        import sqlite3 as _sqlite3
+        data = request.get_json(force=True)
+        required = ["key", "value", "added_by"]
+        missing = [k for k in required if not data.get(k)]
+        if missing:
+            return jsonify({"error": f"Missing fields: {missing}"}), 400
+
+        conn = _sqlite3.connect("/home/claude/fg_workflows.db")
+        conn.execute("""
+            INSERT OR REPLACE INTO frozen_facts (fact_key, fact_value, added_by, created_at, active)
+            VALUES (?, ?, ?, ?, 1)
+        """, (data["key"], data["value"], data["added_by"], datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+
+        AuditTrail.log_change("create", "frozen_fact", data["key"],
+                              data["added_by"], {"value": data["value"]})
+        return jsonify({"status": "added", "key": data["key"], "value": data["value"]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/frozen-facts/<fact_key>", methods=["DELETE"])
+def api_delete_frozen_fact(fact_key: str):
+    """Deactivate a dynamic frozen fact (system base facts cannot be deleted)."""
+    try:
+        from claude_code_agent_ecosystem import HallucinationGuard
+        if fact_key in HallucinationGuard._BASE_FROZEN_FACTS:
+            return jsonify({"error": "Cannot delete a base system fact"}), 403
+
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect("/home/claude/fg_workflows.db")
+        conn.execute("UPDATE frozen_facts SET active = 0 WHERE fact_key = ?", (fact_key,))
+        conn.commit()
+        conn.close()
+
+        user = request.args.get("user", "admin")
+        AuditTrail.log_change("delete", "frozen_fact", fact_key, user, {})
+        return jsonify({"status": "deactivated", "key": fact_key})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================================
+# ENVIRONMENT STATUS API
+# ============================================================================
+@app.route("/api/environment", methods=["GET"])
+def api_environment_status():
+    """Return the current ecosystem environment configuration."""
+    try:
+        from claude_code_agent_ecosystem import FG_ENV, IS_LAB_MODE, ACTIVE_MODEL, LAB_BUDGET_MULTIPLIER
+        return jsonify({
+            "env": FG_ENV,
+            "is_lab_mode": IS_LAB_MODE,
+            "active_model": ACTIVE_MODEL,
+            "budget_multiplier": LAB_BUDGET_MULTIPLIER,
+            "scaffold_mode_default": True,
+            "emails_suppressed": IS_LAB_MODE,
+            "description": (
+                "Lab mode: cheaper model, emails suppressed, relaxed budgets"
+                if IS_LAB_MODE else
+                "Production mode: full guardrails, opus model, strict budgets"
+            )
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================================
+# BDR DOCUMENT QUEUE API
+# ============================================================================
+@app.route("/api/bdr-queue", methods=["GET"])
+def api_bdr_queue():
+    """Return the current BDR document ingestion queue."""
+    try:
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect("/home/claude/fg_workflows.db")
+        cursor = conn.execute("""
+            SELECT doc_id, filename, file_type, raw_row_count, status, ingested_at, cleared_at
+            FROM bdr_documents ORDER BY ingested_at DESC LIMIT 50
+        """)
+        docs = [{"doc_id": r[0], "filename": r[1], "file_type": r[2], "row_count": r[3],
+                 "status": r[4], "ingested_at": r[5], "cleared_at": r[6]}
+                for r in cursor.fetchall()]
+        conn.close()
+        return jsonify({"documents": docs, "count": len(docs)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================================
 # ERROR HANDLERS
 # ============================================================================
 @app.errorhandler(404)
