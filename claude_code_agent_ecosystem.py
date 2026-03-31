@@ -56,7 +56,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)-8s %(message)s',
     handlers=[
-        logging.FileHandler('/home/claude/fg_agents.log'),
+        logging.FileHandler(os.environ.get("FG_LOG_PATH", "/home/claude/fg_agents.log")),
         logging.StreamHandler()
     ]
 )
@@ -512,7 +512,9 @@ class WorkflowExecution:
 class WorkflowDatabase:
     """Unified SQLite database for workflows, approvals, agent calls, and hallucination flags."""
 
-    def __init__(self, db_path: str = "/home/claude/fg_workflows.db"):
+    def __init__(self, db_path: str = None):
+        if db_path is None:
+            db_path = os.environ.get("FG_DB_PATH", "/home/claude/fg_workflows.db")
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.cursor = self.conn.cursor()
@@ -1712,7 +1714,9 @@ Output JSON only:
 class KnowledgeLibrary:
     """SQLite database for agent learning, workflow patterns, and lessons."""
 
-    def __init__(self, db_path: str = "/home/claude/fg_knowledge.db"):
+    def __init__(self, db_path: str = None):
+        if db_path is None:
+            db_path = os.environ.get("FG_KNOWLEDGE_DB_PATH", "/home/claude/fg_knowledge.db")
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self._init_tables()

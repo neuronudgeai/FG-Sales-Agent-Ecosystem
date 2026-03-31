@@ -1,0 +1,37 @@
+# ============================================================================
+# Dockerfile.agents — FG Sales Agent Engine
+# Runs the CLI agent system (PM, BA, QA, Vendor, Manager, Data Engineer)
+# ============================================================================
+FROM python:3.11-slim
+
+LABEL org.opencontainers.image.title="FG Sales Agent Engine"
+LABEL org.opencontainers.image.description="First Genesis multi-agent orchestration system"
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source
+COPY claude_code_agent_ecosystem.py .
+COPY entrypoint_agents.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Data directory for SQLite databases and logs
+# Mount a named volume here in production: -v fg_data:/data
+RUN mkdir -p /data
+ENV FG_DB_PATH=/data/fg_workflows.db
+ENV FG_KNOWLEDGE_DB_PATH=/data/fg_knowledge.db
+ENV FG_LOG_PATH=/data/fg_agents.log
+
+# Default to production mode — override with FG_ENV=lab for testing
+ENV FG_ENV=production
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["env_status"]

@@ -1,0 +1,39 @@
+# ============================================================================
+# Dockerfile.dashboard — FG Sales Agent Dashboard Server
+# Runs the Flask/SocketIO real-time dashboard on port 5000
+# ============================================================================
+FROM python:3.11-slim
+
+LABEL org.opencontainers.image.title="FG Sales Agent Dashboard"
+LABEL org.opencontainers.image.description="First Genesis real-time agent monitoring dashboard"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY dashboard_server.py .
+COPY dashboard.html .
+COPY claude_code_agent_ecosystem.py .
+COPY entrypoint_dashboard.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Shared data volume — must match the agents container mount
+RUN mkdir -p /data
+ENV DATABASE_URL=sqlite:////data/fg_dashboard.db
+ENV FG_DB_PATH=/data/fg_workflows.db
+ENV FG_KNOWLEDGE_DB_PATH=/data/fg_knowledge.db
+
+ENV HOST=0.0.0.0
+ENV PORT=5000
+
+EXPOSE 5000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/dashboard')" || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]

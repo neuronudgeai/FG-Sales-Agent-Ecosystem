@@ -1,0 +1,96 @@
+# ============================================================================
+# docker-compose.yml — FG Sales Agent Ecosystem
+#
+# Services:
+#   dashboard   — real-time Flask/SocketIO UI at http://localhost:5000
+#   agents      — one-shot CLI runner (cron-triggered or manual)
+#   scheduler   — runs agents on a fixed daily schedule (6 AM, 9 AM, 5 PM)
+#
+# Quick start:
+#   1. cp .env.example .env
+#   2. Add your ANTHROPIC_API_KEY to .env
+#   3. docker compose up -d dashboard
+#   4. docker compose run --rm agents run_pm_agent
+#
+# Lab mode (cheap, no emails):
+#   FG_ENV=lab docker compose run --rm agents run_pm_agent
+# ============================================================================
+
+services:
+
+  # ── Dashboard Server ────────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: fg_dashboard
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    env_file: .env
+    environment:
+      - HOST=0.0.0.0
+      - PORT=5000
+      - DATABASE_URL=sqlite:////data/fg_dashboard.db
+      - FG_DB_PATH=/data/fg_workflows.db
+      - FG_KNOWLEDGE_DB_PATH=/data/fg_knowledge.db
+    volumes:
+      - fg_data:/data
+    networks:
+      - fg_network
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/dashboard')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+  # ── Agent Engine (manual / one-shot) ────────────────────────────────────────
+  # Usage: docker compose run --rm agents <command>
+  # Examples:
+  #   docker compose run --rm agents run_pm_agent
+  #   docker compose run --rm agents budget_status
+  #   docker compose run --rm agents bdr_queue
+  agents:
+    build:
+      context: .
+      dockerfile: Dockerfile.agents
+    container_name: fg_agents
+    env_file: .env
+    environment:
+      - FG_DB_PATH=/data/fg_workflows.db
+      - FG_KNOWLEDGE_DB_PATH=/data/fg_knowledge.db
+      - FG_LOG_PATH=/data/fg_agents.log
+    volumes:
+      - fg_data:/data
+      - ./bdr_inbox:/bdr_inbox:ro   # drop BDR files here for ingestion
+    networks:
+      - fg_network
+    depends_on:
+      dashboard:
+        condition: service_healthy
+
+  # ── Scheduler (cron-style agent runs) ───────────────────────────────────────
+  # Runs PM agent at 6 AM, BA+QA at 9 AM, Manager report at 5 PM (UTC)
+  # Override AGENT_SCHEDULE_* in .env to adjust timing
+  scheduler:
+    image: mcuadros/ofelia:latest
+    container_name: fg_scheduler
+    restart: unless-stopped
+    depends_on:
+      - agents
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./scheduler.ini:/etc/ofelia/config.ini:ro
+    networks:
+      - fg_network
+
+# ── Shared volume for all SQLite databases and logs ──────────────────────────
+volumes:
+  fg_data:
+    driver: local
+
+networks:
+  fg_network:
+    driver: bridge

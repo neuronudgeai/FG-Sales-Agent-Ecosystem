@@ -53,7 +53,7 @@ except ImportError:
 class Config:
     SECRET_KEY        = os.environ.get("SECRET_KEY", "fg-dashboard-secret-key")
     SQLALCHEMY_DATABASE_URI = os.environ.get(
-        "DATABASE_URL", "sqlite:////home/claude/fg_dashboard.db"
+        "DATABASE_URL", "sqlite:////data/fg_dashboard.db"
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 

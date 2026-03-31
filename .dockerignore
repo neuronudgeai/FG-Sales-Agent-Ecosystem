@@ -1,0 +1,11 @@
+# Never copy secrets or local data into the image
+.env
+*.db
+*.log
+*.pyc
+__pycache__/
+.git/
+.gitignore
+bdr_inbox/
+*.xlsx
+*.csv
