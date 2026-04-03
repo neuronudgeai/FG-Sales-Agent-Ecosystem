@@ -51,7 +51,7 @@ services:
   # Examples:
   #   docker compose run --rm agents run_pm_agent
   #   docker compose run --rm agents budget_status
-  #   docker compose run --rm agents bdr_queue
+  #   docker compose run --rm agents budget_status
   agents:
     build:
       context: .
@@ -64,7 +64,6 @@ services:
       - FG_LOG_PATH=/data/fg_agents.log
     volumes:
       - fg_data:/data
-      - ./bdr_inbox:/bdr_inbox:ro   # drop BDR files here for ingestion
     networks:
       - fg_network
     depends_on:

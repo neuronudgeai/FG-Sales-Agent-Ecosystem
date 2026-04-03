@@ -582,19 +582,6 @@ class WorkflowDatabase:
                 active INTEGER DEFAULT 1
             );
 
-            CREATE TABLE IF NOT EXISTS bdr_documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                doc_id TEXT UNIQUE NOT NULL,
-                filename TEXT NOT NULL,
-                file_type TEXT NOT NULL,
-                raw_row_count INTEGER DEFAULT 0,
-                extracted_fields TEXT,
-                redaction_map TEXT,
-                clearance_workflow_id TEXT,
-                status TEXT DEFAULT 'pending_clearance',
-                ingested_at TEXT NOT NULL,
-                cleared_at TEXT
-            );
         """)
         self.conn.commit()
         logger.info("Database initialized")
@@ -1193,11 +1180,6 @@ class BudgetEnforcer:
             name="manager_agent", budget_per_call_usd=0.04, max_daily_calls=1,
             max_daily_spend_usd=0.10, priority=1, description="Portfolio dashboard"
         ),
-        "data_engineer_agent": AgentConfig(
-            name="data_engineer_agent", budget_per_call_usd=0.02, max_daily_calls=2,
-            max_daily_spend_usd=0.05, priority=2,
-            description="BDR ingestion, schema validation, pipeline health"
-        ),
     }
 
     def __init__(self, db: WorkflowDatabase):
@@ -1745,170 +1727,6 @@ Sections marked [HUMAN_ONLY] must be empty strings.
                 f"  Weight:        {weight}\n"
                 f"This correction will auto-inject into future {agent_name} calls.\n")
 
-    def run_bdr_intake_agent(self, filepath: str) -> Tuple[str, WorkflowState]:
-        """Ingest a BDR document (CSV or Excel) through the full pipeline.
-
-        Pipeline:
-        1. Parse file (CSV via stdlib, xlsx via openpyxl if available)
-        2. Run PII redaction on all string fields
-        3. Pause at DOCUMENT_CLEARANCE gate for human PII review
-        4. After clearance: use DataEngineerAgent to extract structured summary
-        5. Store parsed doc in bdr_documents table
-        Returns (structured_json, WorkflowState)
-        """
-        doc_id = f"bdr_{uuid.uuid4().hex[:12]}"
-        workflow_id = f"intake_{doc_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        filename = os.path.basename(filepath)
-        file_ext = os.path.splitext(filename)[1].lower()
-
-        logger.info(f"BDR intake started: {filename} (doc_id={doc_id})")
-
-        # Step 1: Parse file into raw rows
-        raw_rows: List[Dict] = []
-        try:
-            if file_ext == ".csv":
-                with open(filepath, "r", encoding="utf-8-sig") as f:
-                    reader = csv.DictReader(f)
-                    raw_rows = [dict(row) for row in reader]
-            elif file_ext in (".xlsx", ".xls"):
-                if not OPENPYXL_AVAILABLE:
-                    raise RuntimeError(
-                        "openpyxl not installed. Run: pip install openpyxl"
-                    )
-                wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
-                ws = wb.active
-                headers = [str(cell.value) for cell in next(ws.iter_rows(min_row=1, max_row=1))]
-                for row in ws.iter_rows(min_row=2, values_only=True):
-                    raw_rows.append(dict(zip(headers, [str(v) if v is not None else "" for v in row])))
-                wb.close()
-            else:
-                raise ValueError(f"Unsupported file type: {file_ext}. Supported: .csv, .xlsx")
-        except Exception as e:
-            logger.error(f"BDR parse failed for {filename}: {e}")
-            raise
-
-        logger.info(f"Parsed {len(raw_rows)} rows from {filename}")
-
-        # Step 2: PII redaction on all string fields
-        redacted_rows = []
-        combined_reverse_map: Dict[str, str] = {}
-        for row in raw_rows:
-            redacted_row, rmap = self.pii_redactor.redact_dict(row)
-            redacted_rows.append(redacted_row)
-            combined_reverse_map.update(rmap)
-
-        redaction_summary = (
-            f"Redacted {len(combined_reverse_map)} PII tokens across {len(raw_rows)} rows.\n"
-            f"Token types: {', '.join(set(k.split('_')[0][1:] for k in combined_reverse_map.keys()))}\n"
-            f"Sample (first row, redacted): {json.dumps(redacted_rows[0] if redacted_rows else {})}"
-        )
-        logger.info(f"PII redaction complete: {len(combined_reverse_map)} tokens replaced")
-
-        # Persist to DB (pre-clearance)
-        self.db.cursor.execute("""
-            INSERT OR REPLACE INTO bdr_documents
-            (doc_id, filename, file_type, raw_row_count, extracted_fields,
-             redaction_map, clearance_workflow_id, status, ingested_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_clearance', ?)
-        """, (
-            doc_id, filename, file_ext,
-            len(raw_rows),
-            json.dumps(redacted_rows[:5]),   # store sample only
-            json.dumps(combined_reverse_map),
-            workflow_id,
-            datetime.now().isoformat()
-        ))
-        self.db.conn.commit()
-
-        # Step 3: Pause for human DOCUMENT_CLEARANCE review
-        clearance_content = (
-            f"BDR Document: {filename}\n"
-            f"Rows: {len(raw_rows)}\n"
-            f"PII Summary: {redaction_summary}\n\n"
-            f"Please review the redacted sample above and approve for LLM ingestion.\n"
-            f"Approve = data cleared for agent analysis.\n"
-            f"Reject = document held, no LLM contact.\n"
-        )
-        workflow_state = self.stage_gate_manager.pause_at_gate(
-            workflow_id=workflow_id,
-            agent_name="data_engineer_agent",
-            project_name=filename,
-            stage_gate_name=StageGateName.DOCUMENT_CLEARANCE,
-            content_pending_approval=clearance_content
-        )
-
-        logger.info(
-            f"BDR intake paused at DOCUMENT_CLEARANCE for {filename}. "
-            f"Awaiting human approval (workflow_id={workflow_id})"
-        )
-        return json.dumps({
-            "doc_id": doc_id,
-            "workflow_id": workflow_id,
-            "filename": filename,
-            "row_count": len(raw_rows),
-            "pii_tokens_redacted": len(combined_reverse_map),
-            "status": "pending_clearance",
-            "message": "Document queued for human PII review before LLM ingestion"
-        }, indent=2), workflow_state
-
-    def complete_bdr_analysis(self, doc_id: str) -> str:
-        """Run DataEngineerAgent analysis after DOCUMENT_CLEARANCE is approved.
-
-        Call this after the DOCUMENT_CLEARANCE approval is processed.
-        Sends the redacted BDR data to Claude for structured extraction.
-        """
-        self.db.cursor.execute(
-            "SELECT * FROM bdr_documents WHERE doc_id = ?", (doc_id,)
-        )
-        row = self.db.cursor.fetchone()
-        if not row:
-            return f"ERROR: Document {doc_id} not found"
-
-        doc_id_, filename, file_type, row_count, extracted_fields, \
-            redaction_map, clearance_wf_id, status, ingested_at, cleared_at = row
-
-        if status == "pending_clearance":
-            return f"ERROR: Document {doc_id} not yet cleared. Awaiting DOCUMENT_CLEARANCE approval."
-
-        redacted_sample = json.loads(extracted_fields or "[]")
-        workflow_id = f"bdr_analysis_{doc_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-        output, call, confidence = self._call_claude(
-            agent_name="data_engineer_agent",
-            system_prompt=(
-                "You are a Data Engineer Agent for First Genesis. "
-                "Extract and normalize structured data from BDR documents. "
-                "Output ONLY valid JSON. Identify field types, data quality issues, "
-                "and flag any fields requiring SME review."
-            ),
-            user_message=f"""Analyze this BDR document sample and extract structured schema.
-Filename: {filename}
-Row count: {row_count}
-Redacted sample rows: {json.dumps(redacted_sample, indent=2)}
-
-Output JSON only:
-{{
-  "schema": {{"field_name": "inferred_type", ...}},
-  "data_quality": {{"issues": [], "completeness_pct": 95}},
-  "sme_review_fields": ["field1"],
-  "extraction_summary": "...",
-  "confidence": 4
-}}""",
-            workflow_id=workflow_id,
-            scaffold_mode=False
-        )
-
-        if not output:
-            return f"ERROR: DataEngineerAgent call failed: {call.reason}"
-
-        # Mark document as analyzed
-        self.db.cursor.execute(
-            "UPDATE bdr_documents SET status = 'analyzed', cleared_at = ? WHERE doc_id = ?",
-            (datetime.now().isoformat(), doc_id)
-        )
-        self.db.conn.commit()
-
-        return output
 
 
 
@@ -2127,112 +1945,6 @@ class KnowledgeLibrary:
                 "usage_count": row[7]
             })
         return lessons
-
-
-# ============================================================================
-# DATA ENGINEER AGENT (6th agent — bridges data engineering resource gap)
-# ============================================================================
-class DataEngineerAgent:
-    """Standalone Data Engineer Agent for pipeline health, schema validation,
-    and missing data dependency detection.
-
-    This is the 6th agent in the ecosystem, bridging the resource gap identified
-    in the meeting. It does NOT replace a human data engineer but handles:
-    - Schema drift detection
-    - Pipeline health checks
-    - Data dependency alerts via the AgentCommunicationBus
-    - BDR document queue management
-    """
-
-    def __init__(self, db: WorkflowDatabase, knowledge_library: KnowledgeLibrary,
-                 comm_bus=None):
-        self.db = db
-        self.knowledge_library = knowledge_library
-        self.comm_bus = comm_bus  # Optional AgentCommunicationBus
-
-    def check_pipeline_health(self) -> Dict:
-        """Inspect the bdr_documents table for stale/blocked documents."""
-        self.db.cursor.execute("""
-            SELECT status, COUNT(*) as cnt, MAX(ingested_at) as latest
-            FROM bdr_documents GROUP BY status
-        """)
-        rows = self.db.cursor.fetchall()
-        health = {
-            "checked_at": datetime.now().isoformat(),
-            "by_status": {r[0]: {"count": r[1], "latest": r[2]} for r in rows},
-            "alerts": []
-        }
-
-        # Flag documents stuck in pending_clearance > 4 hours
-        self.db.cursor.execute("""
-            SELECT doc_id, filename, ingested_at FROM bdr_documents
-            WHERE status = 'pending_clearance'
-        """)
-        for doc_id, filename, ingested_at in self.db.cursor.fetchall():
-            try:
-                age_hours = (datetime.now() - datetime.fromisoformat(ingested_at)).total_seconds() / 3600
-                if age_hours > 4:
-                    alert = {
-                        "type": "DATA_DEPENDENCY_MISSING",
-                        "severity": "high",
-                        "doc_id": doc_id,
-                        "filename": filename,
-                        "message": f"BDR document '{filename}' stuck in clearance for {age_hours:.1f}h"
-                    }
-                    health["alerts"].append(alert)
-                    logger.warning(f"DataEngineerAgent: {alert['message']}")
-                    # Broadcast to Manager Agent via comm bus if available
-                    if self.comm_bus:
-                        self.comm_bus.send_message(
-                            from_agent="data_engineer_agent",
-                            to_agent="manager_agent",
-                            message_type=MessageType.ESCALATE,
-                            content=alert
-                        )
-            except (ValueError, TypeError):
-                pass
-
-        return health
-
-    def validate_schema(self, data: Dict, expected_fields: List[str]) -> Dict:
-        """Validate that required fields are present and non-empty."""
-        missing = [f for f in expected_fields if f not in data or not data[f]]
-        unexpected = [k for k in data if k not in expected_fields]
-        result = {
-            "valid": len(missing) == 0,
-            "missing_fields": missing,
-            "unexpected_fields": unexpected,
-            "completeness_pct": round(
-                (len(expected_fields) - len(missing)) / len(expected_fields) * 100, 1
-            ) if expected_fields else 100.0
-        }
-        if missing:
-            logger.warning(f"Schema validation: missing fields {missing}")
-        return result
-
-    def get_bdr_queue_summary(self) -> str:
-        """Return a human-readable BDR document queue summary."""
-        health = self.check_pipeline_health()
-        by_status = health["by_status"]
-        alerts = health["alerts"]
-
-        lines = [
-            "\n" + "=" * 70,
-            "DATA ENGINEER AGENT — BDR QUEUE STATUS",
-            "=" * 70,
-        ]
-        for status, info in by_status.items():
-            lines.append(f"  {status:30} {info['count']:>4} docs  (latest: {info['latest']})")
-
-        if alerts:
-            lines.append(f"\nALERTS ({len(alerts)}):")
-            for a in alerts:
-                lines.append(f"  [{a['severity'].upper()}] {a['message']}")
-        else:
-            lines.append("\nNo alerts — pipeline healthy.")
-
-        lines.append("=" * 70 + "\n")
-        return "\n".join(lines)
 
 
 # ============================================================================
@@ -2590,9 +2302,7 @@ class AgentCostModel:
     QA_AGENT     = {"name": "QA Agent",           "input_tokens": 8000, "output_tokens": 2000, "calls_per_day": 1, "description": "Pre-delivery audit, scope creep detection"}
     VENDOR_AGENT = {"name": "Vendor Agent",       "input_tokens": 4000, "output_tokens":  800, "calls_per_day": 1, "description": "Partner SLA tracking, performance monitoring"}
     MANAGER_AGENT= {"name": "Manager Agent",      "input_tokens": 5000, "output_tokens": 1500, "calls_per_day": 1, "description": "Portfolio dashboard, orchestration"}
-    DATA_ENGINEER= {"name": "Data Engineer Agent","input_tokens": 4500, "output_tokens":  900, "calls_per_day": 2, "description": "BDR ingestion, schema validation, pipeline health"}
-
-    ALL_AGENTS = [PM_AGENT, BA_AGENT, QA_AGENT, VENDOR_AGENT, MANAGER_AGENT, DATA_ENGINEER]
+    ALL_AGENTS = [PM_AGENT, BA_AGENT, QA_AGENT, VENDOR_AGENT, MANAGER_AGENT]
 
     @staticmethod
     def cost_per_agent(agent: dict) -> float:
@@ -2855,12 +2565,6 @@ def main():
         print("    --feedback <comment>")
         print("  budget_status             Show live budget usage report")
         print("  audit_hallucinations      Show recent hallucination flags")
-        print("\nBDR Ingestion Commands:")
-        print("  run_bdr_intake            Ingest a BDR document (CSV/Excel)")
-        print("    --file <path>           Path to CSV or xlsx file")
-        print("  bdr_queue                 Show BDR document queue status")
-        print("  complete_bdr_analysis     Run analysis after clearance approval")
-        print("    --doc-id <id>")
         print("\nSME & Guardrail Commands:")
         print("  add_correction            Record an SME correction for an agent")
         print("    --agent <name>          Agent name (pm_agent, ba_agent, etc.)")
@@ -2990,45 +2694,6 @@ def main():
                 print(f"  Reason:  {reason}")
                 if snippet:
                     print(f"  Snippet: {snippet[:80]}...")
-
-    elif command == "run_bdr_intake":
-        kwargs = {}
-        i = 2
-        while i < len(sys.argv):
-            if sys.argv[i] == "--file" and i + 1 < len(sys.argv):
-                kwargs['filepath'] = sys.argv[i + 1]; i += 2
-            else:
-                i += 1
-        if 'filepath' not in kwargs:
-            print("ERROR: --file <path> required")
-            sys.exit(1)
-        result, workflow_state = agent.run_bdr_intake_agent(**kwargs)
-        print("\n" + "=" * 70)
-        print("BDR INTAKE RESULT")
-        print("=" * 70)
-        print(result)
-        print(f"\nWorkflow: {workflow_state.workflow_id}")
-        print(f"Gate:     {workflow_state.current_stage_gate.value}")
-        print(f"Status:   {workflow_state.status.value}")
-
-    elif command == "bdr_queue":
-        de = DataEngineerAgent(agent.db, agent.knowledge_library)
-        print(de.get_bdr_queue_summary())
-
-    elif command == "complete_bdr_analysis":
-        kwargs = {}
-        i = 2
-        while i < len(sys.argv):
-            if sys.argv[i] == "--doc-id" and i + 1 < len(sys.argv):
-                kwargs['doc_id'] = sys.argv[i + 1]; i += 2
-            else:
-                i += 1
-        if 'doc_id' not in kwargs:
-            print("ERROR: --doc-id required")
-            sys.exit(1)
-        result = agent.complete_bdr_analysis(**kwargs)
-        print("\nBDR Analysis Result:")
-        print(result)
 
     elif command == "add_correction":
         kwargs = {}

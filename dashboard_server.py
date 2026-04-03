@@ -781,28 +781,6 @@ def api_environment_status():
 
 
 # ============================================================================
-# BDR DOCUMENT QUEUE API
-# ============================================================================
-@app.route("/api/bdr-queue", methods=["GET"])
-def api_bdr_queue():
-    """Return the current BDR document ingestion queue."""
-    try:
-        import sqlite3 as _sqlite3
-        conn = _sqlite3.connect("/home/claude/fg_workflows.db")
-        cursor = conn.execute("""
-            SELECT doc_id, filename, file_type, raw_row_count, status, ingested_at, cleared_at
-            FROM bdr_documents ORDER BY ingested_at DESC LIMIT 50
-        """)
-        docs = [{"doc_id": r[0], "filename": r[1], "file_type": r[2], "row_count": r[3],
-                 "status": r[4], "ingested_at": r[5], "cleared_at": r[6]}
-                for r in cursor.fetchall()]
-        conn.close()
-        return jsonify({"documents": docs, "count": len(docs)})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ============================================================================
 # ERROR HANDLERS
 # ============================================================================
 @app.errorhandler(404)
