@@ -817,22 +817,22 @@ class StageGateManager:
             name=StageGateName.CHARTER_APPROVAL,
             description="Project Charter Review & Approval",
             approver_email="tjohnson@firstgenesis.com",
-            cc_emails=["pwatty@firstgenesis.com", "emaiteu@firstgenesis.com"],
+            cc_emails=["pwatty@firstgenesis.com", "emathieu@firstgenesis.com"],
             require_comment=False,
             timeout_hours=24
         ),
         StageGateName.REQUIREMENTS_APPROVAL: StageGate(
             name=StageGateName.REQUIREMENTS_APPROVAL,
             description="Requirements Specification Review",
-            approver_email="k.phipps@firstgenesis.com",
-            cc_emails=["tjohnson@firstgenesis.com", "emaiteu@firstgenesis.com"],
+            approver_email="kphipps@firstgenesis.com",
+            cc_emails=["tjohnson@firstgenesis.com", "emathieu@firstgenesis.com"],
             require_comment=True,
             timeout_hours=12
         ),
         StageGateName.QA_AUDIT_APPROVAL: StageGate(
             name=StageGateName.QA_AUDIT_APPROVAL,
             description="QA Audit & Pre-Delivery Approval",
-            approver_email="emaiteu@firstgenesis.com",
+            approver_email="emathieu@firstgenesis.com",
             cc_emails=["tjohnson@firstgenesis.com"],
             require_comment=False,
             timeout_hours=6
@@ -849,15 +849,15 @@ class StageGateManager:
             name=StageGateName.BUDGET_ESCALATION,
             description="Budget Alert - Approval to Continue",
             approver_email="pwatty@firstgenesis.com",
-            cc_emails=["emaiteu@firstgenesis.com"],
+            cc_emails=["emathieu@firstgenesis.com"],
             require_comment=True,
             timeout_hours=1
         ),
         StageGateName.DOCUMENT_CLEARANCE: StageGate(
             name=StageGateName.DOCUMENT_CLEARANCE,
             description="Inbound Document PII Review Before LLM Ingestion",
-            approver_email="k.phipps@firstgenesis.com",
-            cc_emails=["emaiteu@firstgenesis.com", "tjohnson@firstgenesis.com"],
+            approver_email="kphipps@firstgenesis.com",
+            cc_emails=["emathieu@firstgenesis.com", "tjohnson@firstgenesis.com"],
             require_comment=True,
             timeout_hours=4
         ),
@@ -872,8 +872,8 @@ class StageGateManager:
         StageGateName.SME_REVIEW: StageGate(
             name=StageGateName.SME_REVIEW,
             description="Low-Confidence Agent Output — SME Review Required",
-            approver_email="k.phipps@firstgenesis.com",
-            cc_emails=["emaiteu@firstgenesis.com"],
+            approver_email="kphipps@firstgenesis.com",
+            cc_emails=["emathieu@firstgenesis.com"],
             require_comment=True,
             timeout_hours=8
         ),
