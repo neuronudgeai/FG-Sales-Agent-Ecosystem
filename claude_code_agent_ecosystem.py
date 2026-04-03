@@ -724,76 +724,179 @@ class WorkflowDatabase:
 # ============================================================================
 # EMAIL GATEWAY (Outlook SMTP)
 # ============================================================================
-class EmailGateway:
-    """Send approval emails to humans via Outlook SMTP."""
+# EMAIL GATEWAY — Microsoft Graph API (primary) + SMTP (fallback)
+#
+# Provider selection (set in .env):
+#   EMAIL_PROVIDER=graph   → Microsoft Graph API via OAuth2 client credentials
+#   EMAIL_PROVIDER=smtp    → Outlook SMTP (legacy, requires app password)
+#   EMAIL_PROVIDER=none    → Disable email (gates log only — useful in lab mode)
+#
+# Graph API env vars:
+#   MS_TENANT_ID       Azure AD tenant ID (Directory ID)
+#   MS_CLIENT_ID       App registration client ID
+#   MS_CLIENT_SECRET   App registration client secret
+#   MS_SENDER_EMAIL    Email address the agent sends FROM (kphipps@firstgenesis.com)
+#
+# SMTP env vars (fallback):
+#   OUTLOOK_SENDER     Sender email
+#   OUTLOOK_PASSWORD   Outlook app-specific password
+# ============================================================================
 
-    def __init__(self, sender_email: Optional[str] = None,
-                 sender_password: Optional[str] = None):
-        self.sender_email = sender_email or os.environ.get("OUTLOOK_SENDER")
-        self.sender_password = sender_password or os.environ.get("OUTLOOK_PASSWORD")
-        self.smtp_server = "smtp.office365.com"
-        self.smtp_port = 587
+import urllib.request
+import urllib.parse
+import urllib.error
 
-        if not self.sender_email or not self.sender_password:
-            logger.warning("Email credentials not configured. Email gates will be skipped.")
+class GraphEmailGateway:
+    """Send approval emails via Microsoft Graph API (OAuth2 client credentials).
+
+    Requires an Azure AD app registration with Mail.Send application permission
+    and admin consent granted. No user login or app passwords needed.
+
+    One-time Azure setup (5 minutes):
+      1. portal.azure.com → Azure Active Directory → App registrations → New
+      2. Name: FG-Agent-System  |  Account type: Single tenant
+      3. Note: Application (client) ID  and  Directory (tenant) ID
+      4. Certificates & secrets → New client secret → copy value
+      5. API permissions → Add → Microsoft Graph → Application → Mail.Send
+      6. Click "Grant admin consent for [tenant]"
+    """
+
+    GRAPH_TOKEN_URL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    GRAPH_SEND_URL  = "https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
+    GRAPH_SCOPE     = "https://graph.microsoft.com/.default"
+
+    def __init__(self):
+        self.tenant_id     = os.environ.get("MS_TENANT_ID")
+        self.client_id     = os.environ.get("MS_CLIENT_ID")
+        self.client_secret = os.environ.get("MS_CLIENT_SECRET")
+        self.sender_email  = os.environ.get("MS_SENDER_EMAIL", "kphipps@firstgenesis.com")
+        self._token: Optional[str] = None
+        self._token_expiry: float = 0.0
+
+        missing = [k for k, v in {
+            "MS_TENANT_ID": self.tenant_id,
+            "MS_CLIENT_ID": self.client_id,
+            "MS_CLIENT_SECRET": self.client_secret,
+        }.items() if not v]
+
+        if missing:
+            logger.warning(f"Graph API email not configured. Missing: {missing}")
             self.enabled = False
         else:
             self.enabled = True
+            logger.info(f"Graph API email gateway ready (sender: {self.sender_email})")
 
-    def send_approval_request(self, workflow_id: str, stage_gate: StageGate,
-                              agent_name: str, project_name: str,
-                              content_summary: str, content_detail: str) -> bool:
-        if not self.enabled:
-            logger.warning(f"Email disabled. Approval email for {workflow_id} not sent.")
-            return False
+    def _get_token(self) -> Optional[str]:
+        """Fetch or reuse an OAuth2 access token (cached, auto-refreshes)."""
+        import time
+        if self._token and time.time() < self._token_expiry - 60:
+            return self._token
 
-        subject = f"[Approval Required] {agent_name} - {stage_gate.description} ({project_name})"
-        body = f"""
-APPROVAL REQUEST
+        url = self.GRAPH_TOKEN_URL.format(tenant_id=self.tenant_id)
+        payload = urllib.parse.urlencode({
+            "grant_type":    "client_credentials",
+            "client_id":     self.client_id,
+            "client_secret": self.client_secret,
+            "scope":         self.GRAPH_SCOPE,
+        }).encode()
+
+        try:
+            req = urllib.request.Request(url, data=payload, method="POST")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            import time as _time
+            self._token = data["access_token"]
+            self._token_expiry = _time.time() + data.get("expires_in", 3600)
+            logger.info("Graph API token acquired")
+            return self._token
+        except Exception as e:
+            logger.error(f"Graph API token fetch failed: {e}")
+            return None
+
+    def _build_email_body(self, workflow_id: str, stage_gate: "StageGate",
+                          agent_name: str, project_name: str,
+                          content_summary: str, content_detail: str) -> str:
+        return f"""APPROVAL REQUEST — First Genesis Agent System
+{'='*60}
 Agent:        {agent_name}
 Project:      {project_name}
 Stage Gate:   {stage_gate.description}
 Workflow ID:  {workflow_id}
-Request Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Sent:         {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
 
 SUMMARY:
 {content_summary}
 
-DETAILED CONTENT:
-{content_detail[:500]}...
+CONTENT PREVIEW:
+{content_detail[:600]}...
 
-ACTION REQUIRED:
-Reply to this email with:
-  APPROVED  (to approve and allow agent to proceed)
-  REJECTED  (to reject and pause workflow)
+{'='*60}
+ACTION REQUIRED — reply with one of:
+  APPROVED   → agent proceeds to next step
+  REJECTED   → workflow paused, no further action taken
 
-Optional: Include feedback in your reply.
-Timeout: This request will auto-escalate in {stage_gate.timeout_hours} hours if no response.
-
----
-This is an automated message from First Genesis Agent System.
-Plain text replies only please.
+You may include feedback after your decision word.
+Auto-escalates in {stage_gate.timeout_hours} hour(s) if no reply received.
+{'='*60}
+This is an automated message from the FG Sales Agent System.
 """
+
+    def send_approval_request(self, workflow_id: str, stage_gate: "StageGate",
+                              agent_name: str, project_name: str,
+                              content_summary: str, content_detail: str) -> bool:
+        if not self.enabled:
+            logger.warning(f"Graph email disabled. Approval for {workflow_id} not sent.")
+            return False
+
+        token = self._get_token()
+        if not token:
+            logger.error(f"Cannot send email for {workflow_id}: no access token")
+            return False
+
+        subject = (f"[Action Required] {stage_gate.description} — "
+                   f"{project_name} ({agent_name})")
+        body = self._build_email_body(
+            workflow_id, stage_gate, agent_name, project_name,
+            content_summary, content_detail
+        )
+
+        # Build recipient list
+        to_recipients = [{"emailAddress": {"address": stage_gate.approver_email}}]
+        cc_recipients = [
+            {"emailAddress": {"address": addr}}
+            for addr in (stage_gate.cc_emails or [])
+        ]
+
+        payload = json.dumps({
+            "message": {
+                "subject": subject,
+                "body": {"contentType": "Text", "content": body},
+                "toRecipients": to_recipients,
+                "ccRecipients": cc_recipients,
+            },
+            "saveToSentItems": True
+        }).encode()
+
+        url = self.GRAPH_SEND_URL.format(sender=urllib.parse.quote(self.sender_email))
         try:
-            message = MIMEMultipart()
-            message["From"] = self.sender_email
-            message["To"] = stage_gate.approver_email
-            if stage_gate.cc_emails:
-                message["Cc"] = ", ".join(stage_gate.cc_emails)
-            message["Subject"] = subject
-            message.attach(MIMEText(body, "plain"))
-
-            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
-                server.starttls()
-                server.login(self.sender_email, self.sender_password)
-                recipients = [stage_gate.approver_email] + (stage_gate.cc_emails or [])
-                server.sendmail(self.sender_email, recipients, message.as_string())
-
-            logger.info(f"Approval email sent for {workflow_id} to {stage_gate.approver_email}")
-            return True
-
+            req = urllib.request.Request(url, data=payload, method="POST")
+            req.add_header("Authorization", f"Bearer {token}")
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                # Graph returns 202 Accepted on success (no body)
+                success = resp.status == 202
+            if success:
+                logger.info(
+                    f"Graph email sent for {workflow_id} → {stage_gate.approver_email}"
+                )
+            return success
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode()[:300]
+            logger.error(f"Graph email HTTP {e.code} for {workflow_id}: {err_body}")
+            return False
         except Exception as e:
-            logger.error(f"Failed to send approval email for {workflow_id}: {str(e)}")
+            logger.error(f"Graph email failed for {workflow_id}: {e}")
             return False
 
     def parse_approval_response(self, email_subject: str, email_body: str) -> Tuple[str, str]:
@@ -806,8 +909,109 @@ Plain text replies only please.
             decision = "clarification_needed"
         return decision, email_body.strip()
 
-# ============================================================================
-# STAGE GATE MANAGER
+
+class SmtpEmailGateway:
+    """Send approval emails via Outlook SMTP (legacy fallback).
+    Requires an Outlook app-specific password. Use GraphEmailGateway instead
+    for Microsoft 365 business accounts.
+    """
+
+    def __init__(self):
+        self.sender_email  = os.environ.get("OUTLOOK_SENDER")
+        self.sender_password = os.environ.get("OUTLOOK_PASSWORD")
+        self.smtp_server = "smtp.office365.com"
+        self.smtp_port   = 587
+
+        if not self.sender_email or not self.sender_password:
+            logger.warning("SMTP email not configured (OUTLOOK_SENDER / OUTLOOK_PASSWORD missing).")
+            self.enabled = False
+        else:
+            self.enabled = True
+            logger.info(f"SMTP email gateway ready (sender: {self.sender_email})")
+
+    def send_approval_request(self, workflow_id: str, stage_gate: "StageGate",
+                              agent_name: str, project_name: str,
+                              content_summary: str, content_detail: str) -> bool:
+        if not self.enabled:
+            logger.warning(f"SMTP disabled. Approval for {workflow_id} not sent.")
+            return False
+
+        subject = (f"[Action Required] {stage_gate.description} — "
+                   f"{project_name} ({agent_name})")
+        body = (
+            f"APPROVAL REQUEST\nAgent: {agent_name}\nProject: {project_name}\n"
+            f"Stage Gate: {stage_gate.description}\nWorkflow ID: {workflow_id}\n\n"
+            f"SUMMARY:\n{content_summary}\n\nCONTENT:\n{content_detail[:500]}...\n\n"
+            f"Reply APPROVED or REJECTED (with optional feedback).\n"
+            f"Auto-escalates in {stage_gate.timeout_hours}h.\n"
+        )
+        try:
+            msg = MIMEMultipart()
+            msg["From"]    = self.sender_email
+            msg["To"]      = stage_gate.approver_email
+            msg["Subject"] = subject
+            if stage_gate.cc_emails:
+                msg["Cc"] = ", ".join(stage_gate.cc_emails)
+            msg.attach(MIMEText(body, "plain"))
+
+            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+                server.starttls()
+                server.login(self.sender_email, self.sender_password)
+                recipients = [stage_gate.approver_email] + (stage_gate.cc_emails or [])
+                server.sendmail(self.sender_email, recipients, msg.as_string())
+
+            logger.info(f"SMTP email sent for {workflow_id} → {stage_gate.approver_email}")
+            return True
+        except Exception as e:
+            logger.error(f"SMTP email failed for {workflow_id}: {e}")
+            return False
+
+    def parse_approval_response(self, email_subject: str, email_body: str) -> Tuple[str, str]:
+        body_upper = email_body.upper()
+        if "APPROVED" in body_upper:
+            decision = "approved"
+        elif "REJECTED" in body_upper:
+            decision = "rejected"
+        else:
+            decision = "clarification_needed"
+        return decision, email_body.strip()
+
+
+# Keep EmailGateway as the legacy name so nothing else breaks
+EmailGateway = SmtpEmailGateway
+
+
+def create_email_gateway():
+    """Factory — returns the right gateway based on EMAIL_PROVIDER env var.
+
+    EMAIL_PROVIDER=graph  → GraphEmailGateway  (Microsoft Graph API, recommended)
+    EMAIL_PROVIDER=smtp   → SmtpEmailGateway   (Outlook SMTP, legacy)
+    EMAIL_PROVIDER=none   → SmtpEmailGateway   (disabled, no-op)
+    default               → tries Graph first, falls back to SMTP
+    """
+    provider = os.environ.get("EMAIL_PROVIDER", "auto").lower()
+
+    if provider == "graph":
+        return GraphEmailGateway()
+    elif provider == "smtp":
+        return SmtpEmailGateway()
+    elif provider == "none":
+        logger.info("Email provider set to none — all gates will log only.")
+        return SmtpEmailGateway()   # credentials missing → self.enabled=False → no-op
+    else:
+        # Auto: prefer Graph if configured, fall back to SMTP
+        gw = GraphEmailGateway()
+        if gw.enabled:
+            logger.info("Email provider: Graph API (auto-selected)")
+            return gw
+        gw = SmtpEmailGateway()
+        if gw.enabled:
+            logger.info("Email provider: SMTP (auto-selected fallback)")
+            return gw
+        logger.warning("Email provider: none configured — gates will log only.")
+        return gw   # returns disabled SMTP gateway as a safe no-op
+
+
 # ============================================================================
 class StageGateManager:
     """Manage stage gates and approval workflows."""
@@ -1250,7 +1454,7 @@ class AutonomousAgentWithEmailGates:
     def __init__(self, api_key: Optional[str] = None):
         self.client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
         self.db = WorkflowDatabase()
-        self.email_gateway = EmailGateway()
+        self.email_gateway = create_email_gateway()
         self.stage_gate_manager = StageGateManager(self.db, self.email_gateway)
         self.budget_enforcer = BudgetEnforcer(self.db)
         self.hallucination_guard = HallucinationGuard(self.db)
