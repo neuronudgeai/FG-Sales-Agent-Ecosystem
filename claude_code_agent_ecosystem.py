@@ -385,28 +385,39 @@ Vendor: {vendor_name}
 Type: {deliverable_type}
 Reviewed: {review_date}
 
-PROJECT BASELINE (frozen facts):
-  Client:    Malcolm Goodwin
-  Project:   AURA MVP
-  Scope:     Silhouette technology + 3D mesh design + actor model
-  Timeline:  3 months (deadline April 30 2026)
-  Vendor:    Yubi
+PROJECT BASELINE — AURA PHASE 1 MVP:
+  Client:       Malcolm Goodwin
+  Project:      Aura Phase 1 MVP — Body Intelligence Infrastructure
+                for Personalized Bras and Adaptive Apparel
+  Timeline:     2026-03-23 → 2026-06-23 (3 months)
+  Total Tasks:  450 across 9 phases
+  Phase Scope:  Initiation | Discovery | Requirements | Solution Design |
+                MVP Execution | Testing | Deployment | Optimization | Governance
+  Key Outputs:  Comfort Spec (manufacturing specs), Feature Graph (25-30 anatomy points),
+                Silhouette Experience (privacy-first 3D), Maddie (AI context capture)
+  Vendors:      FitMatch (3D scan SDK), Xenese (platform)
+  PM/BA Owners: Trice Johnson / Kiera Phipps
+  Architect:    UB (Principal Solutions Architect)
+  AT RISK:      Task 1.3 — FitMatch legal agreements (deadline 2026-03-31)
+  IN SCOPE ONLY: Phase 1 MVP. Phase 2/3 features are OUT OF SCOPE.
 
 VENDOR DELIVERABLE TEXT:
 {deliverable_text}
 
-Review this deliverable and respond in JSON only — no preamble, no explanation.
+Review this deliverable against the AURA Phase 1 MVP scope above.
+Respond in JSON only — no preamble, no explanation.
 Mark any field you cannot assess as "[NEEDS_SME_INPUT]".
 
 {{
   "scope_compliance_score": <1-5>,
-  "in_scope_items": ["..."],
-  "out_of_scope_items": ["..."],
-  "scope_gaps": ["..."],
+  "in_scope_items": ["items that align with Phase 1 scope"],
+  "out_of_scope_items": ["items outside Phase 1"],
+  "scope_gaps": ["Phase 1 scope items not covered by this deliverable"],
   "timeline_risk": "LOW|MEDIUM|HIGH",
   "timeline_notes": "...",
   "budget_impact": "NONE|LOW|MEDIUM|HIGH",
   "budget_notes": "...",
+  "fitMatch_dependency_risk": "does this rely on the at-risk FitMatch legal agreement?",
   "recommendation": "APPROVE|FLAG|REJECT",
   "pm_notes": "...",
   "confidence": <1-5>
@@ -421,25 +432,40 @@ Vendor: {vendor_name}
 Type: {deliverable_type}
 Reviewed: {review_date}
 
-PROJECT REQUIREMENTS CONTEXT:
-  Project:   AURA MVP
-  Client:    Malcolm Goodwin
-  Core Scope: Silhouette technology + 3D mesh design + actor model
-  Deadline:  April 30 2026
+AURA PHASE 1 REQUIREMENTS CONTEXT:
+  Project:        Aura Phase 1 MVP — Body Intelligence Infrastructure
+  Client:         Malcolm Goodwin
+  Timeline:       2026-03-23 → 2026-06-23
+  Core Deliverables:
+    - Feature Graph: 25-30 anatomical measurement points from 3D body scan
+    - Comfort Spec: Manufacturing-ready bra design specification
+    - Silhouette Experience: Privacy-first visualization (no raw mesh exposure)
+    - Maddie: Conversational AI capturing comfort feedback, lifestyle, wellness context
+  Phase Requirements in Progress:
+    - Phase 2 Discovery: Anatomical framework, manufacturer schema, FitMatch data, baseline measurements
+    - Phase 3 Requirements: Scope definition, BRD, FRD, non-functional requirements
+    - Phase 4 Solution Design: Architecture, integration, geometry engine, UX/Maddie design
+  Key Constraints:
+    - No raw anatomical data exposed to users (privacy requirement)
+    - Wellness inputs (menstrual, menopause) are OUT OF SCOPE for MVP
+    - FitMatch SDK is the only approved scan source
+    - Manufacturing outputs must be interpretable by production partner
 
 VENDOR DELIVERABLE TEXT:
 {deliverable_text}
 
-Assess this deliverable against AURA project requirements.
+Assess this deliverable against AURA Phase 1 requirements.
 Fill facts only. Respond in JSON only — no preamble.
 
 {{
   "requirements_coverage_score": <1-5>,
-  "satisfied_requirements": ["..."],
-  "unsatisfied_requirements": ["..."],
+  "satisfied_requirements": ["requirements this deliverable addresses"],
+  "unsatisfied_requirements": ["Phase 1 requirements not addressed"],
   "missing_acceptance_criteria": ["..."],
   "data_quality_notes": "...",
-  "integration_concerns": ["..."],
+  "integration_concerns": ["FitMatch / Xenese / Maddie integration gaps"],
+  "privacy_compliance": "does this respect the no-raw-mesh-exposure requirement?",
+  "out_of_scope_items": ["Phase 2/3 features included that should be excluded"],
   "recommendation": "APPROVE|FLAG|REJECT",
   "ba_notes": "...",
   "confidence": <1-5>
@@ -454,6 +480,21 @@ Vendor: {vendor_name}
 Type: {deliverable_type}
 Reviewed: {review_date}
 
+AURA PHASE 1 QA STANDARDS:
+  Project:    Aura Phase 1 MVP
+  Test Phases: 6.1 Functional | 6.2 Integration | 6.3 Data/Geometry |
+               6.4 Maddie/AI | 6.5 UX/Silhouette | 6.6 Performance |
+               6.7 Regression | 6.8 UAT | 6.9 Defect Mgmt | 6.10 Security |
+               6.11 Manufacturing Validation
+  Key Standards:
+    - Measurements must align with baseline manual dataset within tolerances
+    - Silhouette must replace raw mesh in ALL user flows
+    - No sensitive/PII data exposed in outputs
+    - API response times within defined latency targets
+    - Comfort Spec must be interpretable by manufacturing partner
+    - Maddie must not generate unsafe or medical guidance
+    - Security: RBAC, encryption at rest and in transit, no raw mesh in user flows
+
 VENDOR DELIVERABLE TEXT:
 {deliverable_text}
 
@@ -463,12 +504,14 @@ Respond in JSON only — no preamble.
 {{
   "quality_score": <1-5>,
   "completeness_pct": <0-100>,
-  "defects_found": ["..."],
-  "quality_standards_met": ["..."],
-  "quality_standards_failed": ["..."],
+  "defects_found": ["specific issues or gaps found"],
+  "quality_standards_met": ["which AURA QA standards this passes"],
+  "quality_standards_failed": ["which AURA QA standards this fails"],
+  "privacy_violations": ["any raw mesh or PII exposure issues"],
   "risk_level": "LOW|MEDIUM|HIGH",
   "scope_creep_detected": true|false,
-  "scope_creep_notes": "...",
+  "scope_creep_notes": "phase 2/3 features mistakenly included?",
+  "manufacturing_ready": true|false,
   "recommendation": "APPROVE|FLAG|REJECT",
   "qa_notes": "...",
   "confidence": <1-5>
@@ -752,6 +795,22 @@ class WorkflowDatabase:
                 status TEXT DEFAULT 'pending_clearance',
                 ingested_at TEXT NOT NULL,
                 cleared_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS project_tasks (
+                task_id TEXT PRIMARY KEY,
+                task_description TEXT,
+                role TEXT,
+                start_date TEXT,
+                end_date TEXT,
+                sprint_owner TEXT,
+                resource_names TEXT,
+                dependencies TEXT,
+                task_status TEXT DEFAULT 'Not Started',
+                comments TEXT,
+                acceptance_criteria TEXT,
+                phase TEXT NOT NULL,
+                loaded_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS vendor_deliverables (
@@ -1456,23 +1515,54 @@ class HallucinationGuard:
 
     # Hardcoded baseline — these are always active
     _BASE_FROZEN_FACTS = {
-        "project_timeline_aura": "3 months",
-        "project_client_aura": "Malcolm Goodwin",
-        "daily_budget": "$5 USD",
-        "team_pm": "Kiera Phipps",
-        "team_cto": "Ron Watty",
-        "team_cdo": "Trice Johnson",
-        "team_pmo": "Elina Mathieu",
-        "team_ceo": "Pascal Watty",
-        "vendor_wbt": "Yubi",
-        "deadline_wbt": "April 30, 2026"
+        # ── Project Identity ─────────────────────────────────────────────────
+        "project_name":           "Aura Phase 1 MVP",
+        "project_description":    "Body Intelligence Infrastructure for Personalized Bras and Adaptive Apparel",
+        "project_client":         "Malcolm Goodwin",
+        "project_start_date":     "2026-03-23",
+        "project_end_date":       "2026-06-23",
+        "project_timeline":       "3 months (March 23 – June 23, 2026)",
+        "project_total_tasks":    "450 tasks across 9 phases",
+        # ── Phases ───────────────────────────────────────────────────────────
+        "project_phases":         ("1.0 Initiation | 2.0 Discovery | 3.0 Requirements | "
+                                   "4.0 Solution Design | 5.0 MVP Execution | 6.0 Testing | "
+                                   "7.0 Deployment | 8.0 Optimization | 9.0 Project Governance"),
+        # ── Team ─────────────────────────────────────────────────────────────
+        "team_pm_ba":             "Trice Johnson (tjohnson@firstgenesis.com) / Kiera Phipps (kphipps@firstgenesis.com)",
+        "team_pm":                "Kiera Phipps",
+        "team_cdo":               "Trice Johnson",
+        "team_pmo":               "Elina Mathieu (emathieu@firstgenesis.com)",
+        "team_cto":               "Ron Watty (pwatty@firstgenesis.com)",
+        "team_architect":         "UB (Principal Solutions Architect)",
+        "team_data_scientist":    "Joshua (Data Scientist)",
+        "team_data_scientist_ii": "Bert (Data Scientist II)",
+        "team_design":            "Cassandra (Principal Design Consultant)",
+        "team_ux":                "Daniel (UX/UI Developer)",
+        "team_platform":          "Olu (DLT/Full-Stack Engineer)",
+        "team_devops":            "UB / Thomas (DevOps)",
+        # ── Vendors & Integrations ────────────────────────────────────────────
+        "vendor_fitMatch":        "FitMatch — 3D body scan SDK (primary data source)",
+        "platform_xenese":        "Xenese — feature computation and API orchestration platform",
+        # ── Key Outputs ───────────────────────────────────────────────────────
+        "output_comfort_spec":    "Comfort Spec — manufacturing-ready bra design specification",
+        "output_feature_graph":   "Feature Graph — 25-30 computed anatomical measurement points",
+        "output_silhouette":      "Silhouette Experience — privacy-first 3D visualization",
+        "output_maddie":          "Maddie — conversational AI context capture engine",
+        # ── Risk / Status ─────────────────────────────────────────────────────
+        "at_risk_task":           "1.3 — FitMatch legal agreements (data access rights), deadline 2026-03-31",
+        "completed_task":         "1.1 — Statement of Work (SOW) defined and finalized",
+        "on_track_task":          "1.2 — Assumptions and dependencies review with stakeholders",
+        # ── Budget ────────────────────────────────────────────────────────────
+        "daily_budget":           "$5 USD (agent ecosystem daily cap)",
     }
 
     IMPOSSIBLE_CLAIMS = [
-        (r"Chevron.*approved", "Chevron not approved yet"),
-        (r"AURA.*complete|AURA.*finished", "AURA just kicked off"),
-        (r"new hire|brought on|onboarded", "No hiring decisions made yet"),
-        (r"first genesis.*failed|bankruptcy|shutdown", "Company operational"),
+        (r"AURA.*complete|AURA.*finished|aura.*delivered", "AURA Phase 1 MVP still in progress"),
+        (r"FitMatch.*approved|fitMatch.*signed", "FitMatch legal agreement (Task 1.3) still at risk"),
+        (r"Comfort Spec.*shipped|comfort spec.*done", "Comfort Spec generation not yet built (Phase 5)"),
+        (r"new hire|brought on|onboarded", "No new hiring decisions documented"),
+        (r"first genesis.*failed|bankruptcy|shutdown", "First Genesis operational"),
+        (r"phase 2|phase 3|phase four", "Only Phase 1 MVP is in scope"),
     ]
 
     def __init__(self, db: WorkflowDatabase):
@@ -2594,6 +2684,163 @@ Output JSON only:
         lines.append("="*70 + "\n")
         return "\n".join(lines)
 
+    # ── PROJECT PLAN TRACKING ─────────────────────────────────────────────────
+
+    def load_project_plan(self, filepath: str) -> str:
+        """Load AURA project tasks from JSON into the project_tasks table.
+
+        Idempotent: re-running updates existing records rather than duplicating.
+        """
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                plan = json.load(f)
+        except Exception as e:
+            return f"ERROR: Could not read project plan file: {e}"
+
+        tasks = plan.get("tasks", [])
+        loaded = 0
+        skipped = 0
+        now = datetime.now().isoformat()
+
+        for t in tasks:
+            # Skip header rows (no description)
+            task_id = str(t.get("Task_ID", "")).strip()
+            desc = str(t.get("Task_Description", "")).strip()
+            if not task_id or task_id in ("nan", "None") or not desc or desc in ("nan", "None"):
+                skipped += 1
+                continue
+
+            self.db.cursor.execute("""
+                INSERT INTO project_tasks
+                (task_id, task_description, role, start_date, end_date,
+                 sprint_owner, resource_names, dependencies, task_status,
+                 comments, acceptance_criteria, phase, loaded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    task_description=excluded.task_description,
+                    role=excluded.role,
+                    start_date=excluded.start_date,
+                    end_date=excluded.end_date,
+                    sprint_owner=excluded.sprint_owner,
+                    resource_names=excluded.resource_names,
+                    dependencies=excluded.dependencies,
+                    task_status=excluded.task_status,
+                    comments=excluded.comments,
+                    acceptance_criteria=excluded.acceptance_criteria,
+                    phase=excluded.phase,
+                    loaded_at=excluded.loaded_at
+            """, (
+                task_id,
+                desc,
+                str(t.get("Role", "") or ""),
+                str(t.get("Start_Date", "") or ""),
+                str(t.get("End_Date", "") or ""),
+                str(t.get("Sprint_Owner", "") or ""),
+                str(t.get("Resource_Names", "") or ""),
+                str(t.get("Dependencies", "") or ""),
+                str(t.get("Task_Status", "Not Started") or "Not Started"),
+                str(t.get("Comments", "") or ""),
+                str(t.get("Acceptance_Criteria", "") or ""),
+                str(t.get("Phase", "") or ""),
+                now,
+            ))
+            loaded += 1
+
+        self.db.conn.commit()
+        return (
+            f"\n{'='*70}\n"
+            f"AURA PROJECT PLAN LOADED\n"
+            f"{'='*70}\n"
+            f"  Tasks loaded/updated: {loaded}\n"
+            f"  Skipped (headers):    {skipped}\n"
+            f"  Total in JSON:        {len(tasks)}\n"
+            f"  Source file:          {filepath}\n"
+            f"  Loaded at:            {now}\n"
+            f"{'='*70}\n"
+        )
+
+    def get_project_status(self, phase: str = None) -> str:
+        """Show AURA project task status summary, optionally filtered by phase."""
+        if phase:
+            self.db.cursor.execute("""
+                SELECT phase, task_status, COUNT(*) as cnt
+                FROM project_tasks
+                WHERE phase LIKE ?
+                GROUP BY phase, task_status
+                ORDER BY phase, task_status
+            """, (f"%{phase}%",))
+        else:
+            self.db.cursor.execute("""
+                SELECT phase, task_status, COUNT(*) as cnt
+                FROM project_tasks
+                GROUP BY phase, task_status
+                ORDER BY phase, task_status
+            """)
+        rows = self.db.cursor.fetchall()
+
+        if not rows:
+            return "No project tasks loaded. Run: load_project_plan --file aura_project_plan.json"
+
+        lines = ["\n" + "="*70,
+                 "AURA PHASE 1 MVP — PROJECT STATUS",
+                 "="*70]
+        current_phase = None
+        phase_totals = {}
+        for ph, status, cnt in rows:
+            if ph != current_phase:
+                lines.append(f"\n  {ph}")
+                current_phase = ph
+            status_label = status or "Not Started"
+            lines.append(f"    {status_label:20} {cnt:>4} task(s)")
+            phase_totals[ph] = phase_totals.get(ph, 0) + cnt
+
+        # Overall counts
+        self.db.cursor.execute(
+            "SELECT task_status, COUNT(*) FROM project_tasks GROUP BY task_status"
+        )
+        overall = dict(self.db.cursor.fetchall())
+        total = sum(overall.values())
+        lines.append(f"\n{'─'*70}")
+        lines.append(f"  OVERALL TOTALS ({total} tasks):")
+        for s, c in sorted(overall.items()):
+            lines.append(f"    {(s or 'Not Started'):20} {c:>4}  ({c/total*100:.0f}%)")
+        lines.append("="*70 + "\n")
+        return "\n".join(lines)
+
+    def get_at_risk_tasks(self) -> str:
+        """Show all tasks flagged as At Risk or with missing critical dependencies."""
+        self.db.cursor.execute("""
+            SELECT task_id, task_description, phase, sprint_owner,
+                   start_date, end_date, task_status, comments, dependencies
+            FROM project_tasks
+            WHERE task_status IN ('At Risk', 'Blocked', 'Overdue')
+               OR (dependencies != '' AND dependencies != 'nan'
+                   AND task_status IN ('Not Started', '', NULL))
+            ORDER BY phase, task_id
+        """)
+        rows = self.db.cursor.fetchall()
+
+        lines = ["\n" + "="*70, "AURA PROJECT — AT RISK / BLOCKED TASKS", "="*70]
+        if not rows:
+            lines.append("  No at-risk tasks identified.")
+        for tid, desc, ph, owner, start, end, status, comments, deps in rows:
+            lines.append(f"\n  [{status or 'Not Started'}] {tid} — {ph}")
+            lines.append(f"    {desc[:80]}")
+            lines.append(f"    Owner: {owner or '—'}  |  {start or '?'} → {end or '?'}")
+            if deps and deps not in ("nan", "None", ""):
+                lines.append(f"    Depends on: {deps[:80]}")
+            if comments and comments not in ("nan", "None", ""):
+                lines.append(f"    Note: {comments[:80]}")
+
+        # Always show the known at-risk item from frozen facts
+        lines.append(f"\n{'─'*70}")
+        lines.append("  KNOWN RISK (from project baseline):")
+        lines.append("  [AT RISK] Task 1.3 — FitMatch legal agreements (data access rights)")
+        lines.append("    Deadline: 2026-03-31 | Owner: Trice/Kiera")
+        lines.append("    Impact: Blocks all FitMatch SDK integration tasks in Phase 5")
+        lines.append("="*70 + "\n")
+        return "\n".join(lines)
+
     def submit_sme_correction(self, agent_name: str, original_output_hash: str,
                               original_snippet: str, corrected_content: str,
                               correction_category: str, corrector_name: str,
@@ -3507,34 +3754,13 @@ def main():
         print("  show_executive_summary    Full executive summary")
         print("  token_dashboard           Full token strategy dashboard")
         print("  demo_dashboard            Run dashboard demo")
-        sys.exit(1)
-        print("\nSME & Guardrail Commands:")
-        print("  add_correction            Record an SME correction for an agent")
-        print("    --agent <name>          Agent name (pm_agent, ba_agent, etc.)")
-        print("    --hash <output_hash>    Hash of the original output")
-        print("    --snippet <text>        Snippet of wrong output")
-        print("    --correction <text>     What the correct output should be")
-        print("    --category <text>       Correction category")
-        print("    --corrector <name>      SME name making the correction")
-        print("    --weight <1-5>          Importance weight (default: 1)")
-        print("  list_corrections          Show SME corrections for an agent")
-        print("    --agent <name>")
-        print("  add_frozen_fact           Add a new ground-truth fact")
-        print("    --key <fact_key>")
-        print("    --value <fact_value>")
-        print("    --added-by <name>")
-        print("\nEnvironment Commands:")
-        print("  env_status                Show current environment (lab/production)")
-        print("                            Set FG_ENV=lab to switch to lab mode")
-        print("\nToken Strategy Commands:")
-        print("  show_budget_model         Daily budget allocation")
-        print("  show_cost_breakdown       Per-agent cost breakdown (incl. Data Engineer)")
-        print("  show_optimization_impact  Technique savings analysis")
-        print("  project_monthly_cost      Monthly cost scenarios")
-        print("  show_executive_summary    Complete executive summary")
-        print("  token_dashboard           Full token strategy dashboard")
-        print("\nDashboard & Command Center Commands:")
-        print("  demo_dashboard            Run dashboard demo with simulated agents")
+        print()
+        print("AURA Project Tracking:")
+        print("  load_project_plan         Load AURA task plan from JSON into DB")
+        print("    --file <path>           Path to aura_project_plan.json")
+        print("  project_status            Show task status by phase")
+        print("    --phase <name>          (optional) filter by phase name")
+        print("  at_risk_tasks             Show at-risk, blocked, or dependency-blocked tasks")
         sys.exit(1)
 
     command = sys.argv[1]
@@ -3800,6 +4026,40 @@ def main():
         else:
             print(f"\n  [PRODUCTION] Full guardrails active")
         print(f"{'='*70}\n")
+
+    elif command == "load_project_plan":
+        filepath = None
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--file" and i + 1 < len(sys.argv):
+                filepath = sys.argv[i + 1]; i += 2
+            else:
+                i += 1
+        if not filepath:
+            print("ERROR: --file <path> is required"); sys.exit(1)
+        try:
+            print(agent.load_project_plan(filepath))
+        except Exception as e:
+            logger.error(f"Error: {e}"); print(f"ERROR: {e}")
+
+    elif command == "project_status":
+        phase_filter = None
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--phase" and i + 1 < len(sys.argv):
+                phase_filter = sys.argv[i + 1]; i += 2
+            else:
+                i += 1
+        try:
+            print(agent.get_project_status(phase=phase_filter))
+        except Exception as e:
+            logger.error(f"Error: {e}"); print(f"ERROR: {e}")
+
+    elif command == "at_risk_tasks":
+        try:
+            print(agent.get_at_risk_tasks())
+        except Exception as e:
+            logger.error(f"Error: {e}"); print(f"ERROR: {e}")
 
     else:
         print(f"Unknown command: {command}")
