@@ -1,4 +1,4 @@
-# FG Sales Agent Ecosystem
+# FG Agent Ecosystem
 
 A production-grade, containerized, multi-agent AI system built for **First Genesis** to automate and govern the full project delivery lifecycle — from project charter generation through final customer delivery — with human-in-the-loop approval gates, budget enforcement, hallucination detection, and a real-time web dashboard.
 
