@@ -6,7 +6,7 @@ A production-grade, containerized, multi-agent AI system built for **First Genes
 
 ## Overview
 
-The FG Sales Agent Ecosystem orchestrates five specialized AI agents powered by **Claude (claude-opus-4-6)** through the Anthropic API. Each agent handles a distinct phase of a project engagement. Workflows are gated at five critical checkpoints, requiring human email approval before the system advances. All activity is persisted in SQLite, with costs tracked per agent call and a hallucination guard validating every AI output before it is accepted.
+The FG Agent Ecosystem orchestrates five specialized AI agents powered by **Claude (claude-opus-4-6)** through the Anthropic API. Each agent handles a distinct phase of a project engagement. Workflows are gated at five critical checkpoints, requiring human email approval before the system advances. All activity is persisted in SQLite, with costs tracked per agent call and a hallucination guard validating every AI output before it is accepted.
 
 A companion Flask/WebSocket dashboard server (`dashboard_server.py`) provides a real-time command center for monitoring agent status, budget consumption, pending approvals, and collaboration activity.
 
