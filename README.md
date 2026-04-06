@@ -269,4 +269,4 @@ The following facts are hardcoded and any agent output contradicting them will b
 
 ## License
 
-This repository is proprietary to **First Genesis**. All rights reserved.
+This repository is proprietary to **NeuroNudge AI**. All rights reserved.
