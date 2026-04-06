@@ -372,6 +372,112 @@ Report Generated: {timestamp}
 }
 
 # ============================================================================
+# PHASE 1 REVIEW TEMPLATES
+# Agents do NOT create deliverables in Phase 1.
+# They review, assess, and approve vendor-submitted documents.
+# ============================================================================
+REVIEW_TEMPLATES = {
+    "pm_agent": {
+        "scope_compliance_review": """\
+SCOPE COMPLIANCE REVIEW — PM Agent
+Deliverable ID: {deliverable_id}
+Vendor: {vendor_name}
+Type: {deliverable_type}
+Reviewed: {review_date}
+
+PROJECT BASELINE (frozen facts):
+  Client:    Malcolm Goodwin
+  Project:   AURA MVP
+  Scope:     Silhouette technology + 3D mesh design + actor model
+  Timeline:  3 months (deadline April 30 2026)
+  Vendor:    Yubi
+
+VENDOR DELIVERABLE TEXT:
+{deliverable_text}
+
+Review this deliverable and respond in JSON only — no preamble, no explanation.
+Mark any field you cannot assess as "[NEEDS_SME_INPUT]".
+
+{{
+  "scope_compliance_score": <1-5>,
+  "in_scope_items": ["..."],
+  "out_of_scope_items": ["..."],
+  "scope_gaps": ["..."],
+  "timeline_risk": "LOW|MEDIUM|HIGH",
+  "timeline_notes": "...",
+  "budget_impact": "NONE|LOW|MEDIUM|HIGH",
+  "budget_notes": "...",
+  "recommendation": "APPROVE|FLAG|REJECT",
+  "pm_notes": "...",
+  "confidence": <1-5>
+}}
+""",
+    },
+    "ba_agent": {
+        "requirements_compliance_review": """\
+REQUIREMENTS COMPLIANCE REVIEW — BA Agent
+Deliverable ID: {deliverable_id}
+Vendor: {vendor_name}
+Type: {deliverable_type}
+Reviewed: {review_date}
+
+PROJECT REQUIREMENTS CONTEXT:
+  Project:   AURA MVP
+  Client:    Malcolm Goodwin
+  Core Scope: Silhouette technology + 3D mesh design + actor model
+  Deadline:  April 30 2026
+
+VENDOR DELIVERABLE TEXT:
+{deliverable_text}
+
+Assess this deliverable against AURA project requirements.
+Fill facts only. Respond in JSON only — no preamble.
+
+{{
+  "requirements_coverage_score": <1-5>,
+  "satisfied_requirements": ["..."],
+  "unsatisfied_requirements": ["..."],
+  "missing_acceptance_criteria": ["..."],
+  "data_quality_notes": "...",
+  "integration_concerns": ["..."],
+  "recommendation": "APPROVE|FLAG|REJECT",
+  "ba_notes": "...",
+  "confidence": <1-5>
+}}
+""",
+    },
+    "qa_agent": {
+        "quality_assessment_review": """\
+QUALITY ASSESSMENT REVIEW — QA Agent
+Deliverable ID: {deliverable_id}
+Vendor: {vendor_name}
+Type: {deliverable_type}
+Reviewed: {review_date}
+
+VENDOR DELIVERABLE TEXT:
+{deliverable_text}
+
+Assess quality, completeness, accuracy, and standards compliance.
+Respond in JSON only — no preamble.
+
+{{
+  "quality_score": <1-5>,
+  "completeness_pct": <0-100>,
+  "defects_found": ["..."],
+  "quality_standards_met": ["..."],
+  "quality_standards_failed": ["..."],
+  "risk_level": "LOW|MEDIUM|HIGH",
+  "scope_creep_detected": true|false,
+  "scope_creep_notes": "...",
+  "recommendation": "APPROVE|FLAG|REJECT",
+  "qa_notes": "...",
+  "confidence": <1-5>
+}}
+""",
+    },
+}
+
+# ============================================================================
 # DATA MODELS
 # ============================================================================
 class StageGateName(Enum):
@@ -383,6 +489,7 @@ class StageGateName(Enum):
     DOCUMENT_CLEARANCE = "document_clearance"   # inbound PII review before LLM ingestion
     LAB_SIGN_OFF = "lab_sign_off"               # required before promoting lab workflow to production
     SME_REVIEW = "sme_review"                   # triggered when agent confidence < 3
+    COMBINED_REVIEW = "combined_review"         # Phase 1: all agents reviewed vendor deliverable → SME
 
 class WorkflowStatus(Enum):
     PENDING = "pending"
@@ -645,6 +752,30 @@ class WorkflowDatabase:
                 status TEXT DEFAULT 'pending_clearance',
                 ingested_at TEXT NOT NULL,
                 cleared_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS vendor_deliverables (
+                deliverable_id TEXT PRIMARY KEY,
+                vendor_name TEXT NOT NULL,
+                deliverable_type TEXT NOT NULL,
+                filename TEXT,
+                content_text TEXT,
+                submitted_at TEXT NOT NULL,
+                review_status TEXT DEFAULT 'pending',
+                pm_assessment TEXT,
+                pm_score INTEGER,
+                ba_assessment TEXT,
+                ba_score INTEGER,
+                qa_assessment TEXT,
+                qa_score INTEGER,
+                combined_review TEXT,
+                overall_score REAL,
+                overall_risk TEXT,
+                recommendation TEXT,
+                sme_decision TEXT,
+                sme_feedback TEXT,
+                workflow_id TEXT,
+                updated_at TEXT
             );
         """)
         self.conn.commit()
@@ -1131,6 +1262,15 @@ class StageGateManager:
             cc_emails=["emathieu@firstgenesis.com"],
             require_comment=True,
             timeout_hours=8
+        ),
+        StageGateName.COMBINED_REVIEW: StageGate(
+            name=StageGateName.COMBINED_REVIEW,
+            description="Phase 1 — Agent Review Complete, Awaiting SME Approval",
+            approver_email="kphipps@firstgenesis.com",
+            cc_emails=["tjohnson@firstgenesis.com", "emathieu@firstgenesis.com",
+                       "pwatty@firstgenesis.com"],
+            require_comment=True,
+            timeout_hours=24
         ),
     }
 
@@ -1990,6 +2130,470 @@ Output JSON only:
         lines.append("="*70 + "\n")
         return "\n".join(lines)
 
+    # ── PHASE 1: VENDOR DELIVERABLE REVIEW ───────────────────────────────────
+    # Agents do NOT create deliverables in Phase 1.
+    # They intake vendor submissions, review them, and pass to SME for approval.
+
+    def intake_vendor_deliverable(self, filepath: str, vendor_name: str,
+                                   deliverable_type: str) -> str:
+        """Phase 1 entry point — ingest a vendor-submitted deliverable.
+
+        Pipeline:
+        1. Parse file (text, CSV, xlsx, PDF-placeholder)
+        2. PII redact content before any LLM ingestion
+        3. Store in vendor_deliverables table (status=pending)
+        4. DOCUMENT_CLEARANCE gate fires for human PII review
+        5. After clearance, call run_vendor_deliverable_review(deliverable_id)
+        """
+        deliverable_id = f"del_{uuid.uuid4().hex[:12]}"
+        filename = os.path.basename(filepath)
+        ext = os.path.splitext(filename)[1].lower()
+        now = datetime.now().isoformat()
+        logger.info(f"Intake: {filename} from {vendor_name} (id={deliverable_id})")
+
+        # ── Parse file content ───────────────────────────────────────────────
+        raw_text = ""
+        try:
+            if ext == ".csv":
+                with open(filepath, "r", encoding="utf-8-sig") as f:
+                    raw_text = f.read()
+            elif ext in (".xlsx", ".xls"):
+                if not OPENPYXL_AVAILABLE:
+                    raise RuntimeError("openpyxl not installed. Run: pip install openpyxl")
+                import openpyxl
+                wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+                ws = wb.active
+                rows = []
+                for row in ws.iter_rows(values_only=True):
+                    rows.append("\t".join([str(v) if v is not None else "" for v in row]))
+                raw_text = "\n".join(rows)
+                wb.close()
+            else:
+                # Treat as plain text / markdown / PDF stub
+                with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                    raw_text = f.read()
+        except Exception as e:
+            logger.error(f"File parse error: {e}")
+            return f"ERROR: Could not parse file '{filename}': {e}"
+
+        # ── PII redact before storing ────────────────────────────────────────
+        redacted_text, pii_map = self.pii_redactor.redact(raw_text)
+        pii_count = len(pii_map)
+
+        # ── Persist deliverable record ───────────────────────────────────────
+        self.db.cursor.execute("""
+            INSERT INTO vendor_deliverables
+            (deliverable_id, vendor_name, deliverable_type, filename,
+             content_text, submitted_at, review_status, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+        """, (deliverable_id, vendor_name, deliverable_type, filename,
+              redacted_text, now, now))
+        self.db.conn.commit()
+
+        # ── DOCUMENT_CLEARANCE gate (PII review before LLM) ─────────────────
+        workflow_id = f"intake_{deliverable_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        clearance_summary = (
+            f"VENDOR DELIVERABLE INTAKE — PII CLEARANCE REQUIRED\n"
+            f"{'='*60}\n"
+            f"  Deliverable ID:  {deliverable_id}\n"
+            f"  Vendor:          {vendor_name}\n"
+            f"  Type:            {deliverable_type}\n"
+            f"  File:            {filename}\n"
+            f"  PII Tokens Found:{pii_count}\n"
+            f"{'='*60}\n"
+            f"REDACTED PREVIEW (first 600 chars):\n"
+            f"{redacted_text[:600]}\n"
+            f"{'='*60}\n"
+            f"ACTION: Review redacted content above.\n"
+            f"If PII removal is satisfactory, reply APPROVED.\n"
+            f"If additional redaction is needed, reply REJECTED with details.\n"
+            f"After approval, the system will run agent review automatically.\n"
+        )
+        wf = self.stage_gate_manager.pause_at_gate(
+            workflow_id=workflow_id,
+            agent_name="ba_agent",
+            project_name="AURA MVP",
+            stage_gate_name=StageGateName.DOCUMENT_CLEARANCE,
+            content_pending_approval=clearance_summary
+        )
+        # Link the clearance workflow back to the deliverable
+        self.db.cursor.execute(
+            "UPDATE vendor_deliverables SET workflow_id=?, review_status='pending_clearance', "
+            "updated_at=? WHERE deliverable_id=?",
+            (workflow_id, datetime.now().isoformat(), deliverable_id)
+        )
+        self.db.conn.commit()
+
+        gate = StageGateManager.STAGE_GATES[StageGateName.DOCUMENT_CLEARANCE]
+        return (
+            f"\n{'='*70}\n"
+            f"DELIVERABLE INTAKE COMPLETE — AWAITING PII CLEARANCE\n"
+            f"{'='*70}\n"
+            f"  Deliverable ID:  {deliverable_id}\n"
+            f"  Vendor:          {vendor_name}\n"
+            f"  Type:            {deliverable_type}\n"
+            f"  File:            {filename}\n"
+            f"  PII tokens redacted: {pii_count}\n"
+            f"  Workflow ID:     {workflow_id}\n"
+            f"  Clearance sent to: {gate.approver_email}\n"
+            f"\nNext step: Once cleared, run:\n"
+            f"  python claude_code_agent_ecosystem.py run_deliverable_review "
+            f"--deliverable-id {deliverable_id}\n"
+            f"{'='*70}\n"
+        )
+
+    def _review_scope_compliance(self, deliverable_text: str,
+                                  deliverable_id: str, vendor_name: str,
+                                  deliverable_type: str) -> Tuple[dict, int]:
+        """PM Agent: check deliverable against AURA project scope."""
+        template = REVIEW_TEMPLATES["pm_agent"]["scope_compliance_review"]
+        prompt = template.format(
+            deliverable_id=deliverable_id,
+            vendor_name=vendor_name,
+            deliverable_type=deliverable_type,
+            review_date=datetime.now().strftime("%Y-%m-%d %H:%M"),
+            deliverable_text=deliverable_text[:4000],  # truncate for token budget
+        )
+        output, call, confidence = self._call_claude(
+            agent_name="pm_agent",
+            system_prompt=(
+                "You are the PM Agent for First Genesis. "
+                "Your Phase 1 role is ONLY to review vendor deliverables — not to create them. "
+                "Output valid JSON only. No explanations."
+            ),
+            user_message=prompt,
+            scaffold_mode=True,
+        )
+        try:
+            assessment = json.loads(output)
+        except json.JSONDecodeError:
+            assessment = {
+                "scope_compliance_score": 1,
+                "recommendation": "FLAG",
+                "pm_notes": f"[PARSE ERROR — raw output: {output[:200]}]",
+                "confidence": confidence,
+            }
+        return assessment, confidence
+
+    def _review_requirements_compliance(self, deliverable_text: str,
+                                         deliverable_id: str, vendor_name: str,
+                                         deliverable_type: str) -> Tuple[dict, int]:
+        """BA Agent: check deliverable against AURA requirements."""
+        template = REVIEW_TEMPLATES["ba_agent"]["requirements_compliance_review"]
+        prompt = template.format(
+            deliverable_id=deliverable_id,
+            vendor_name=vendor_name,
+            deliverable_type=deliverable_type,
+            review_date=datetime.now().strftime("%Y-%m-%d %H:%M"),
+            deliverable_text=deliverable_text[:4000],
+        )
+        output, call, confidence = self._call_claude(
+            agent_name="ba_agent",
+            system_prompt=(
+                "You are the BA Agent for First Genesis. "
+                "Your Phase 1 role is ONLY to review vendor deliverables against requirements — "
+                "not to create requirements. Output valid JSON only. No explanations."
+            ),
+            user_message=prompt,
+            scaffold_mode=True,
+        )
+        try:
+            assessment = json.loads(output)
+        except json.JSONDecodeError:
+            assessment = {
+                "requirements_coverage_score": 1,
+                "recommendation": "FLAG",
+                "ba_notes": f"[PARSE ERROR — raw output: {output[:200]}]",
+                "confidence": confidence,
+            }
+        return assessment, confidence
+
+    def _review_quality_assessment(self, deliverable_text: str,
+                                    deliverable_id: str, vendor_name: str,
+                                    deliverable_type: str) -> Tuple[dict, int]:
+        """QA Agent: assess quality and standards compliance."""
+        template = REVIEW_TEMPLATES["qa_agent"]["quality_assessment_review"]
+        prompt = template.format(
+            deliverable_id=deliverable_id,
+            vendor_name=vendor_name,
+            deliverable_type=deliverable_type,
+            review_date=datetime.now().strftime("%Y-%m-%d %H:%M"),
+            deliverable_text=deliverable_text[:4000],
+        )
+        output, call, confidence = self._call_claude(
+            agent_name="qa_agent",
+            system_prompt=(
+                "You are the QA Agent for First Genesis. "
+                "Your Phase 1 role is ONLY to assess quality of vendor deliverables — "
+                "not to create them. Output valid JSON only. No explanations."
+            ),
+            user_message=prompt,
+            scaffold_mode=True,
+        )
+        try:
+            assessment = json.loads(output)
+        except json.JSONDecodeError:
+            assessment = {
+                "quality_score": 1,
+                "recommendation": "FLAG",
+                "qa_notes": f"[PARSE ERROR — raw output: {output[:200]}]",
+                "confidence": confidence,
+            }
+        return assessment, confidence
+
+    def run_vendor_deliverable_review(self, deliverable_id: str) -> str:
+        """Phase 1 orchestrator — run all three agent reviews on a vendor deliverable.
+
+        Sequence:
+        1. Load deliverable from DB (must be in cleared/pending status)
+        2. PM Agent: scope compliance review
+        3. BA Agent: requirements compliance review
+        4. QA Agent: quality assessment
+        5. Build combined review report
+        6. COMBINED_REVIEW gate → email full report to SME for final approval
+        7. SME decision stored; used to improve future reviews via knowledge library
+        """
+        self.db.cursor.execute(
+            "SELECT vendor_name, deliverable_type, filename, content_text, review_status "
+            "FROM vendor_deliverables WHERE deliverable_id=?",
+            (deliverable_id,)
+        )
+        row = self.db.cursor.fetchone()
+        if not row:
+            return f"ERROR: Deliverable '{deliverable_id}' not found."
+        vendor_name, deliverable_type, filename, content_text, review_status = row
+
+        if review_status == "pending_clearance":
+            return (f"ERROR: Deliverable '{deliverable_id}' is still awaiting PII clearance. "
+                    f"Approve the DOCUMENT_CLEARANCE gate first.")
+        if review_status in ("sme_pending", "approved", "rejected"):
+            return f"Deliverable '{deliverable_id}' already reviewed (status={review_status})."
+
+        logger.info(f"Starting vendor review: {deliverable_id} ({vendor_name})")
+
+        # Update status
+        self.db.cursor.execute(
+            "UPDATE vendor_deliverables SET review_status='under_review', updated_at=? "
+            "WHERE deliverable_id=?",
+            (datetime.now().isoformat(), deliverable_id)
+        )
+        self.db.conn.commit()
+
+        deliverable_text = content_text or ""
+
+        # ── Run all three agent reviews ──────────────────────────────────────
+        logger.info("  PM Agent: scope compliance review...")
+        pm_assessment, pm_conf = self._review_scope_compliance(
+            deliverable_text, deliverable_id, vendor_name, deliverable_type)
+
+        logger.info("  BA Agent: requirements compliance review...")
+        ba_assessment, ba_conf = self._review_requirements_compliance(
+            deliverable_text, deliverable_id, vendor_name, deliverable_type)
+
+        logger.info("  QA Agent: quality assessment...")
+        qa_assessment, qa_conf = self._review_quality_assessment(
+            deliverable_text, deliverable_id, vendor_name, deliverable_type)
+
+        # ── Persist individual assessments ───────────────────────────────────
+        pm_score = pm_assessment.get("scope_compliance_score", 1)
+        ba_score = ba_assessment.get("requirements_coverage_score", 1)
+        qa_score = qa_assessment.get("quality_score", 1)
+        overall_score = round((pm_score + ba_score + qa_score) / 3, 2)
+
+        recommendations = [
+            pm_assessment.get("recommendation", "FLAG"),
+            ba_assessment.get("recommendation", "FLAG"),
+            qa_assessment.get("recommendation", "FLAG"),
+        ]
+        if "REJECT" in recommendations:
+            overall_rec = "REJECT"
+        elif recommendations.count("APPROVE") == 3:
+            overall_rec = "APPROVE"
+        else:
+            overall_rec = "FLAG"
+
+        risks = [pm_assessment.get("timeline_risk", "MEDIUM"),
+                 qa_assessment.get("risk_level", "MEDIUM")]
+        overall_risk = "HIGH" if "HIGH" in risks else ("MEDIUM" if "MEDIUM" in risks else "LOW")
+
+        self.db.cursor.execute("""
+            UPDATE vendor_deliverables SET
+                pm_assessment=?, pm_score=?,
+                ba_assessment=?, ba_score=?,
+                qa_assessment=?, qa_score=?,
+                overall_score=?, overall_risk=?,
+                recommendation=?, review_status='reviewed',
+                updated_at=?
+            WHERE deliverable_id=?
+        """, (
+            json.dumps(pm_assessment), pm_score,
+            json.dumps(ba_assessment), ba_score,
+            json.dumps(qa_assessment), qa_score,
+            overall_score, overall_risk,
+            overall_rec, datetime.now().isoformat(),
+            deliverable_id
+        ))
+        self.db.conn.commit()
+
+        # ── Build combined review report ─────────────────────────────────────
+        flags = []
+        if pm_assessment.get("out_of_scope_items"):
+            flags.append(f"  OUT OF SCOPE: {', '.join(pm_assessment['out_of_scope_items'][:3])}")
+        if pm_assessment.get("scope_gaps"):
+            flags.append(f"  SCOPE GAPS: {', '.join(pm_assessment['scope_gaps'][:3])}")
+        if ba_assessment.get("unsatisfied_requirements"):
+            flags.append(f"  UNMET REQUIREMENTS: {', '.join(ba_assessment['unsatisfied_requirements'][:3])}")
+        if qa_assessment.get("defects_found"):
+            flags.append(f"  DEFECTS: {', '.join(qa_assessment['defects_found'][:3])}")
+        if qa_assessment.get("scope_creep_detected"):
+            flags.append(f"  SCOPE CREEP DETECTED: {qa_assessment.get('scope_creep_notes','')}")
+
+        combined_report = (
+            f"COMBINED AGENT REVIEW REPORT\n"
+            f"{'='*60}\n"
+            f"  Deliverable ID:  {deliverable_id}\n"
+            f"  Vendor:          {vendor_name}\n"
+            f"  Type:            {deliverable_type}\n"
+            f"  File:            {filename}\n"
+            f"  Review Date:     {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            f"{'='*60}\n"
+            f"AGENT SCORES:\n"
+            f"  PM  Scope Compliance:        {pm_score}/5\n"
+            f"  BA  Requirements Coverage:   {ba_score}/5\n"
+            f"  QA  Quality Score:           {qa_score}/5\n"
+            f"  Overall Score:               {overall_score}/5\n"
+            f"  Overall Risk:                {overall_risk}\n"
+            f"  Agent Recommendation:        {overall_rec}\n"
+            f"{'='*60}\n"
+            f"PM AGENT NOTES:\n  {pm_assessment.get('pm_notes','')}\n"
+            f"  Timeline Risk: {pm_assessment.get('timeline_risk','')}\n"
+            f"  Budget Impact: {pm_assessment.get('budget_impact','')}\n"
+            f"\nBA AGENT NOTES:\n  {ba_assessment.get('ba_notes','')}\n"
+            f"  Integration Concerns: {ba_assessment.get('integration_concerns',[])}\n"
+            f"\nQA AGENT NOTES:\n  {qa_assessment.get('qa_notes','')}\n"
+            f"  Completeness: {qa_assessment.get('completeness_pct',0)}%\n"
+        )
+        if flags:
+            combined_report += f"\nFLAGS REQUIRING SME ATTENTION ({len(flags)}):\n"
+            combined_report += "\n".join(flags) + "\n"
+
+        combined_report += (
+            f"\n{'='*60}\n"
+            f"SME ACTION REQUIRED:\n"
+            f"  Reply APPROVED to accept this deliverable.\n"
+            f"  Reply REJECTED with feedback to return to vendor.\n"
+            f"  All agent assessments stored and available for your review.\n"
+            f"{'='*60}\n"
+        )
+
+        # Persist combined review
+        self.db.cursor.execute(
+            "UPDATE vendor_deliverables SET combined_review=?, updated_at=? "
+            "WHERE deliverable_id=?",
+            (combined_report, datetime.now().isoformat(), deliverable_id)
+        )
+        self.db.conn.commit()
+
+        # ── COMBINED_REVIEW gate → SME approval ──────────────────────────────
+        workflow_id = f"review_{deliverable_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        # Route low-confidence outputs to SME_REVIEW first
+        min_conf = min(pm_conf, ba_conf, qa_conf)
+        gate_name = StageGateName.SME_REVIEW if min_conf < 3 else StageGateName.COMBINED_REVIEW
+
+        wf = self.stage_gate_manager.pause_at_gate(
+            workflow_id=workflow_id,
+            agent_name="pm_agent/ba_agent/qa_agent",
+            project_name="AURA MVP",
+            stage_gate_name=gate_name,
+            content_pending_approval=combined_report
+        )
+        self.db.cursor.execute(
+            "UPDATE vendor_deliverables SET workflow_id=?, review_status='sme_pending', "
+            "updated_at=? WHERE deliverable_id=?",
+            (workflow_id, datetime.now().isoformat(), deliverable_id)
+        )
+        self.db.conn.commit()
+
+        # ── Knowledge library: log this review as a workflow pattern ─────────
+        self.knowledge_library.cursor.execute("""
+            INSERT INTO workflow_patterns
+            (pattern_id, name, description, steps, success_rate, avg_duration_hours,
+             use_count, last_used)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT(pattern_id) DO UPDATE SET use_count=use_count+1, last_used=?
+        """, (
+            f"vendor_review_{deliverable_type.lower().replace(' ','_')}",
+            f"Vendor {deliverable_type} Review",
+            f"3-agent review of vendor {deliverable_type} deliverable",
+            f"intake → PII_clearance → PM_review → BA_review → QA_review → SME_approval",
+            100.0, 1.0,
+            datetime.now().isoformat(), datetime.now().isoformat()
+        ))
+        self.knowledge_library.conn.commit()
+
+        gate = StageGateManager.STAGE_GATES[gate_name]
+        return (
+            f"\n{'='*70}\n"
+            f"VENDOR DELIVERABLE REVIEW COMPLETE\n"
+            f"{'='*70}\n"
+            f"  Deliverable:  {filename} ({vendor_name})\n"
+            f"  Overall Score: {overall_score}/5  |  Risk: {overall_risk}\n"
+            f"  Recommendation: {overall_rec}\n"
+            f"  Workflow ID:   {workflow_id}\n"
+            f"  Review sent to SME: {gate.approver_email}\n"
+            f"  CC: {', '.join(gate.cc_emails)}\n"
+            f"\nAll agents have reviewed. Awaiting SME final decision.\n"
+            f"{'='*70}\n"
+        )
+
+    def get_deliverable_queue(self) -> str:
+        """Show all vendor deliverables and their review pipeline status."""
+        self.db.cursor.execute("""
+            SELECT deliverable_id, vendor_name, deliverable_type, filename,
+                   review_status, overall_score, overall_risk, recommendation,
+                   submitted_at, updated_at
+            FROM vendor_deliverables ORDER BY submitted_at DESC
+        """)
+        rows = self.db.cursor.fetchall()
+        lines = ["\n" + "="*70, "PHASE 1 — VENDOR DELIVERABLE QUEUE", "="*70]
+        if not rows:
+            lines.append("  No deliverables in queue.")
+        for r in rows:
+            did, vendor, dtype, fname, status, score, risk, rec, submitted, updated = r
+            score_str = f"{score}/5" if score else "pending"
+            risk_str = risk or "—"
+            rec_str = rec or "—"
+            lines.append(
+                f"\n  [{did}]\n"
+                f"    Vendor:      {vendor}\n"
+                f"    Type:        {dtype}\n"
+                f"    File:        {fname}\n"
+                f"    Status:      {status}\n"
+                f"    Score:       {score_str}  |  Risk: {risk_str}  |  Rec: {rec_str}\n"
+                f"    Submitted:   {submitted}\n"
+                f"    Last Update: {updated}"
+            )
+
+        # Alert on deliverables stuck > 48h without SME decision
+        self.db.cursor.execute("""
+            SELECT deliverable_id, vendor_name, submitted_at
+            FROM vendor_deliverables WHERE review_status = 'sme_pending'
+        """)
+        alerts = []
+        for did, vendor, submitted_at in self.db.cursor.fetchall():
+            try:
+                age_h = (datetime.now() - datetime.fromisoformat(submitted_at)).total_seconds() / 3600
+                if age_h > 48:
+                    alerts.append(f"  [STALE] {did} ({vendor}) waiting {age_h:.1f}h for SME decision")
+            except (ValueError, TypeError):
+                pass
+        if alerts:
+            lines.append(f"\nSTALE ALERTS ({len(alerts)}):")
+            lines.extend(alerts)
+        lines.append("="*70 + "\n")
+        return "\n".join(lines)
+
     def submit_sme_correction(self, agent_name: str, original_output_hash: str,
                               original_snippet: str, corrected_content: str,
                               correction_category: str, corrector_name: str,
@@ -2842,23 +3446,68 @@ def show_token_dashboard():
 def main():
     if len(sys.argv) < 2:
         print("Usage: python claude_code_agent_ecosystem.py [command]")
-        print("\nAgent Commands:")
-        print("  run_pm_agent              Run PM Agent with approval gate (scaffold mode)")
-        print("  run_ba_requirements       Run BA Agent requirements extraction")
-        print("  run_ba_bdr_intake         Ingest BDR document (CSV/Excel) via BA Agent")
-        print("    --file <path>           Path to CSV or Excel file")
-        print("  complete_ba_data_analysis Complete BA data analysis after clearance")
-        print("    --doc-id <id>           BDR document ID from run_ba_bdr_intake")
-        print("  bdr_queue                 Show BDR document intake queue status")
-        print("  check_approvals           Show pending approvals")
+        print()
+        print("╔══════════════════════════════════════════════════════════════════════╗")
+        print("║  PHASE 1 — VENDOR DELIVERABLE REVIEW (Primary Workflow)             ║")
+        print("║  Agents intake, review, and approve vendor submissions.              ║")
+        print("║  Agents do NOT create deliverables in Phase 1.                      ║")
+        print("╚══════════════════════════════════════════════════════════════════════╝")
+        print()
+        print("Phase 1 Commands:")
+        print("  intake_deliverable        Intake a vendor-submitted deliverable")
+        print("    --file <path>           Path to file (txt, csv, xlsx, etc.)")
+        print("    --vendor <name>         Vendor name (e.g. Yubi)")
+        print("    --type <type>           Deliverable type (e.g. 'Design Spec')")
+        print("  run_deliverable_review    Run all agent reviews on a deliverable")
+        print("    --deliverable-id <id>   ID from intake_deliverable")
+        print("  deliverable_queue         Show all deliverables and review status")
+        print()
+        print("Approval & Gate Commands:")
+        print("  check_approvals           Show all pending gate approvals")
         print("  resume_workflows          Resume approved workflows")
-        print("  process_approval          Process approval response")
+        print("  process_approval          Record a gate approval response")
         print("    --workflow-id <id>")
         print("    --approver <email>")
         print("    --decision <approved|rejected>")
         print("    --feedback <comment>")
+        print()
+        print("Budget & Guardrail Commands:")
         print("  budget_status             Show live budget usage report")
         print("  audit_hallucinations      Show recent hallucination flags")
+        print()
+        print("SME & Learning Commands:")
+        print("  add_correction            Record an SME correction for an agent")
+        print("    --agent <name>          Agent name (pm_agent, ba_agent, qa_agent, etc.)")
+        print("    --hash <output_hash>    Hash of the original output")
+        print("    --snippet <text>        Snippet of wrong output")
+        print("    --correction <text>     What the correct output should be")
+        print("    --category <text>       Correction category")
+        print("    --corrector <name>      SME name making the correction")
+        print("    --weight <1-5>          Importance weight (default: 1)")
+        print("  list_corrections          Show SME corrections for an agent")
+        print("    --agent <name>")
+        print("  add_frozen_fact           Add a ground-truth fact to guardrails")
+        print("    --key <fact_key>")
+        print("    --value <fact_value>")
+        print("    --added-by <name>")
+        print()
+        print("Data Intake Commands (BA Agent):")
+        print("  run_ba_bdr_intake         Ingest BDR CSV/Excel via BA Agent")
+        print("    --file <path>")
+        print("  complete_ba_data_analysis Complete analysis after PII clearance")
+        print("    --doc-id <id>")
+        print("  bdr_queue                 Show BDR document pipeline status")
+        print()
+        print("Environment & Reporting:")
+        print("  env_status                Show environment (lab/production)")
+        print("  show_budget_model         Daily budget allocation breakdown")
+        print("  show_cost_breakdown       Per-agent token cost breakdown")
+        print("  show_optimization_impact  Cost savings analysis")
+        print("  project_monthly_cost      Monthly cost scenarios")
+        print("  show_executive_summary    Full executive summary")
+        print("  token_dashboard           Full token strategy dashboard")
+        print("  demo_dashboard            Run dashboard demo")
+        sys.exit(1)
         print("\nSME & Guardrail Commands:")
         print("  add_correction            Record an SME correction for an agent")
         print("    --agent <name>          Agent name (pm_agent, ba_agent, etc.)")
@@ -2912,7 +3561,45 @@ def main():
 
     agent = AutonomousAgentWithEmailGates()
 
-    if command == "run_pm_agent":
+    # ── PHASE 1: VENDOR DELIVERABLE COMMANDS ─────────────────────────────────
+
+    if command == "intake_deliverable":
+        kwargs = {}
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--file"   and i + 1 < len(sys.argv): kwargs["file"]   = sys.argv[i+1]; i += 2
+            elif sys.argv[i] == "--vendor" and i + 1 < len(sys.argv): kwargs["vendor"] = sys.argv[i+1]; i += 2
+            elif sys.argv[i] == "--type"   and i + 1 < len(sys.argv): kwargs["type"]   = sys.argv[i+1]; i += 2
+            else: i += 1
+        for req in ("file", "vendor", "type"):
+            if req not in kwargs:
+                print(f"ERROR: --{req} is required"); sys.exit(1)
+        try:
+            print(agent.intake_vendor_deliverable(kwargs["file"], kwargs["vendor"], kwargs["type"]))
+        except Exception as e:
+            logger.error(f"Error: {e}"); print(f"ERROR: {e}")
+
+    elif command == "run_deliverable_review":
+        deliverable_id = None
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--deliverable-id" and i + 1 < len(sys.argv):
+                deliverable_id = sys.argv[i+1]; i += 2
+            else: i += 1
+        if not deliverable_id:
+            print("ERROR: --deliverable-id is required"); sys.exit(1)
+        try:
+            print(agent.run_vendor_deliverable_review(deliverable_id))
+        except Exception as e:
+            logger.error(f"Error: {e}"); print(f"ERROR: {e}")
+
+    elif command == "deliverable_queue":
+        try:
+            print(agent.get_deliverable_queue())
+        except Exception as e:
+            logger.error(f"Error: {e}"); print(f"ERROR: {e}")
+
+    elif command == "run_pm_agent":
         logger.info("Running PM Agent with email approval gate...")
         try:
             charter, workflow_state = agent.run_pm_agent_with_gates({

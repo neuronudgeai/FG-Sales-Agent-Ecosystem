@@ -758,6 +758,53 @@ def api_delete_frozen_fact(fact_key: str):
 # ============================================================================
 # ENVIRONMENT STATUS API
 # ============================================================================
+@app.route("/api/deliverable-queue", methods=["GET"])
+def api_deliverable_queue():
+    """Phase 1 — return vendor deliverable review pipeline status."""
+    try:
+        from claude_code_agent_ecosystem import AutonomousAgentWithEmailGates
+        agent = AutonomousAgentWithEmailGates()
+        queue_text = agent.get_deliverable_queue()
+
+        agent.db.cursor.execute("""
+            SELECT deliverable_id, vendor_name, deliverable_type, filename,
+                   review_status, overall_score, overall_risk, recommendation,
+                   submitted_at, updated_at
+            FROM vendor_deliverables ORDER BY submitted_at DESC LIMIT 100
+        """)
+        rows = agent.db.cursor.fetchall()
+        deliverables = [
+            {
+                "deliverable_id": r[0],
+                "vendor_name": r[1],
+                "deliverable_type": r[2],
+                "filename": r[3],
+                "review_status": r[4],
+                "overall_score": r[5],
+                "overall_risk": r[6],
+                "recommendation": r[7],
+                "submitted_at": r[8],
+                "updated_at": r[9],
+            }
+            for r in rows
+        ]
+        # Summary counts
+        status_counts = {}
+        for d in deliverables:
+            s = d["review_status"] or "pending"
+            status_counts[s] = status_counts.get(s, 0) + 1
+
+        return jsonify({
+            "summary": queue_text,
+            "deliverables": deliverables,
+            "total": len(deliverables),
+            "status_counts": status_counts,
+            "phase": "Phase 1 — Review & Approve",
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/bdr-queue", methods=["GET"])
 def api_bdr_queue():
     """Return BDR document intake queue status (managed by BA Agent)."""
