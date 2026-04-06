@@ -70,7 +70,7 @@ Every workflow pauses at one of five **stage gates** and sends an approval email
 `HallucinationGuard` validates every Claude response against:
 
 - **Frozen facts** — e.g. the AURA project timeline must be "3 months"; contradictory timelines are rejected.
-- **Impossible claims** — regex patterns catch fabricated events (Chevron approval, AURA completion, unauthorized hires, company failure).
+- **Impossible claims** — regex patterns catch fabricated events (AURA completion, unauthorized hires, company failure).
 - **Soft warnings** — project claims without a document reference are logged for review.
 
 Rejected outputs are recorded in `hallucination_flags` and the agent call is marked `rejected_hallucination`.
