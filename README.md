@@ -28,8 +28,8 @@ FG-Sales-Agent-Ecosystem/
 
 | Agent | Role | Daily Call Limit | Daily Budget |
 |---|---|---|---|
-| `pm_agent` | Project Manager — generates charter, WBS, kickoff checklist | 2 | $0.10 |
-| `ba_agent` | Business Analyst — requirements spec, traceability matrix, design sessions | 3 | $0.15 |
+| `pm_agent` | Project Manager — generates daily charter, WBS, manages kickoff checklist | 2 | $0.10 |
+| `ba_agent` | Business Analyst — manages requirements spec, traceability matrix, design sessions | 3 | $0.15 |
 | `qa_agent` | QA Lead — pre-delivery audit checklist, scope creep detection | 1 | $0.10 |
 | `vendor_agent` | Vendor/Partner Manager — SLA templates, performance scorecards | 1 | $0.05 |
 | `manager_agent` | Portfolio Manager — cross-project dashboard, risk and blocker reporting | 1 | $0.10 |
