@@ -181,6 +181,57 @@ OPEN ITEMS:
 - {open_item_1}
 - {open_item_2}
 """,
+        "data_schema_extraction": """
+DATA SCHEMA EXTRACTION REPORT
+Project: {project_name}
+Source Document: {filename}
+Extracted By: BA Agent
+Date: {extraction_date}
+
+SOURCE SUMMARY:
+  File Type:    {file_type}
+  Row Count:    {row_count}
+  PII Tokens Redacted: {pii_count}
+
+INFERRED SCHEMA:
+Field Name             | Inferred Type  | Nullable | Notes
+-----------------------|----------------|----------|------------------------
+{schema_rows}
+
+DATA QUALITY:
+  Completeness:   {completeness_pct}%
+  Issues Found:   {issue_count}
+  Issues:
+{issues}
+
+REQUIREMENTS EXTRACTED FROM DATA:
+{data_requirements}
+
+SME REVIEW REQUIRED FOR:
+{sme_fields}
+
+HUMAN_ONLY — Data Architect sign-off:
+[HUMAN_ONLY]
+
+Reviewed By: [HUMAN_ONLY]
+""",
+        "data_dependency_map": """
+DATA DEPENDENCY MAP
+Project: {project_name}
+Date: {map_date}
+
+UPSTREAM DEPENDENCIES (data this project consumes):
+{upstream_deps}
+
+DOWNSTREAM DEPENDENCIES (data this project produces):
+{downstream_deps}
+
+MISSING / UNRESOLVED DEPENDENCIES:
+{missing_deps}
+
+INTEGRATION POINTS: [HUMAN_ONLY]
+TECHNICAL DATA FLOW: [HUMAN_ONLY]
+""",
     },
     "qa_agent": {
         "qa_checklist": """
@@ -582,6 +633,19 @@ class WorkflowDatabase:
                 active INTEGER DEFAULT 1
             );
 
+            CREATE TABLE IF NOT EXISTS bdr_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                doc_id TEXT UNIQUE NOT NULL,
+                filename TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                raw_row_count INTEGER DEFAULT 0,
+                extracted_fields TEXT,
+                redaction_map TEXT,
+                clearance_workflow_id TEXT,
+                status TEXT DEFAULT 'pending_clearance',
+                ingested_at TEXT NOT NULL,
+                cleared_at TEXT
+            );
         """)
         self.conn.commit()
         logger.info("Database initialized")
@@ -1165,8 +1229,9 @@ class BudgetEnforcer:
             max_daily_spend_usd=0.10, priority=1, description="Project setup, WBS, status"
         ),
         "ba_agent": AgentConfig(
-            name="ba_agent", budget_per_call_usd=0.04, max_daily_calls=3,
-            max_daily_spend_usd=0.15, priority=1, description="Design sessions, requirements"
+            name="ba_agent", budget_per_call_usd=0.04, max_daily_calls=5,
+            max_daily_spend_usd=0.25, priority=1,
+            description="Requirements, design sessions, data intake, schema extraction"
         ),
         "qa_agent": AgentConfig(
             name="qa_agent", budget_per_call_usd=0.06, max_daily_calls=1,
@@ -1701,6 +1766,229 @@ Sections marked [HUMAN_ONLY] must be empty strings.
                 f"  Approver:  {approver_email}\n"
                 f"  Feedback:  {feedback or 'None'}\n\n"
                 f"Workflow status updated to: {workflow_state.status.value}\n")
+
+    def run_ba_agent_requirements(self, project_metadata: dict) -> Tuple[str, WorkflowState]:
+        """Run BA Agent for requirements extraction — routes to REQUIREMENTS_APPROVAL gate."""
+        workflow_id = f"ba_req_{project_metadata.get('project','proj')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        project_name = project_metadata.get('project', 'Unknown')
+        logger.info(f"Starting BA Agent requirements workflow: {workflow_id}")
+
+        output, call, confidence = self._call_claude(
+            agent_name="ba_agent",
+            system_prompt=(
+                "You are a Business Analyst Agent for First Genesis. "
+                "Extract and document requirements from provided project data. "
+                "Output ONLY valid JSON. You ASSIST human architects — do NOT make design decisions. "
+                "Sections marked [HUMAN_ONLY] must be left as empty strings."
+            ),
+            user_message=f"""Extract requirements from this project data.
+Project: {json.dumps(project_metadata, indent=2)}
+
+Populate the requirements template with EXTRACTED FACTS only.
+Mark unknown fields as \"[NEEDS_SME_INPUT]\".
+
+{{"requirements": {{
+  "functional": [
+    {{"id": "FR1", "description": "...", "priority": "high|medium|low",
+      "acceptance_criteria": "...", "source": "[FACT_EXTRACTED] or [NEEDS_SME_INPUT]"}}
+  ],
+  "non_functional": [
+    {{"id": "NFR1", "category": "performance|security|usability", "description": "..."}}
+  ],
+  "assumptions": [],
+  "constraints": [],
+  "integration_design": "[HUMAN_ONLY]",
+  "technical_approach": "[HUMAN_ONLY]"
+}},
+"traceability_matrix": [],
+"confidence": 4
+}}""",
+            workflow_id=workflow_id,
+            scaffold_mode=True
+        )
+
+        if not output:
+            raise RuntimeError(f"BA Agent call failed: {call.reason}")
+
+        gate = StageGateName.SME_REVIEW if confidence < 3 else StageGateName.REQUIREMENTS_APPROVAL
+        workflow_state = self.stage_gate_manager.pause_at_gate(
+            workflow_id=workflow_id, agent_name="ba_agent", project_name=project_name,
+            stage_gate_name=gate,
+            content_pending_approval=f"[confidence={confidence}/5]\n{output}"
+        )
+        logger.info(f"BA requirements workflow {workflow_id} paused at {gate.value} (confidence={confidence}/5)")
+        return output, workflow_state
+
+    def run_ba_agent_bdr_intake(self, filepath: str) -> Tuple[str, WorkflowState]:
+        """BA Agent ingests a BDR document (CSV or Excel).
+
+        Pipeline:
+        1. Parse file into rows (CSV stdlib / xlsx via openpyxl)
+        2. PII redaction on all string fields
+        3. Pause at DOCUMENT_CLEARANCE gate for human review
+        After approval, call complete_ba_data_analysis() to extract schema + requirements.
+        """
+        doc_id = f"bdr_{uuid.uuid4().hex[:12]}"
+        workflow_id = f"ba_intake_{doc_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        filename = os.path.basename(filepath)
+        file_ext = os.path.splitext(filename)[1].lower()
+        logger.info(f"BA Agent BDR intake started: {filename} (doc_id={doc_id})")
+
+        raw_rows: List[Dict] = []
+        try:
+            if file_ext == ".csv":
+                with open(filepath, "r", encoding="utf-8-sig") as f:
+                    raw_rows = [dict(row) for row in csv.DictReader(f)]
+            elif file_ext in (".xlsx", ".xls"):
+                if not OPENPYXL_AVAILABLE:
+                    raise RuntimeError("openpyxl not installed. Run: pip install openpyxl")
+                wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+                ws = wb.active
+                headers = [str(c.value) for c in next(ws.iter_rows(min_row=1, max_row=1))]
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    raw_rows.append(dict(zip(headers, [str(v) if v is not None else "" for v in row])))
+                wb.close()
+            else:
+                raise ValueError(f"Unsupported file type: {file_ext}. Supported: .csv, .xlsx")
+        except Exception as e:
+            logger.error(f"BA Agent BDR parse failed for {filename}: {e}")
+            raise
+
+        logger.info(f"Parsed {len(raw_rows)} rows from {filename}")
+
+        # PII redaction
+        redacted_rows, combined_map = [], {}
+        for row in raw_rows:
+            r, rmap = self.pii_redactor.redact_dict(row)
+            redacted_rows.append(r)
+            combined_map.update(rmap)
+        logger.info(f"PII redaction: {len(combined_map)} tokens replaced across {len(raw_rows)} rows")
+
+        # Persist pre-clearance record
+        self.db.cursor.execute("""
+            INSERT OR REPLACE INTO bdr_documents
+            (doc_id, filename, file_type, raw_row_count, extracted_fields,
+             redaction_map, clearance_workflow_id, status, ingested_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_clearance', ?)
+        """, (
+            doc_id, filename, file_ext, len(raw_rows),
+            json.dumps(redacted_rows[:5]),
+            json.dumps(combined_map),
+            workflow_id, datetime.now().isoformat()
+        ))
+        self.db.conn.commit()
+
+        clearance_content = (
+            f"BDR Document: {filename}\n"
+            f"Rows: {len(raw_rows)} | PII tokens redacted: {len(combined_map)}\n"
+            f"Sample (first row, redacted):\n{json.dumps(redacted_rows[0] if redacted_rows else {}, indent=2)}\n\n"
+            f"APPROVE to allow BA Agent to extract schema and requirements.\n"
+            f"REJECT to hold document — no LLM contact."
+        )
+        workflow_state = self.stage_gate_manager.pause_at_gate(
+            workflow_id=workflow_id, agent_name="ba_agent", project_name=filename,
+            stage_gate_name=StageGateName.DOCUMENT_CLEARANCE,
+            content_pending_approval=clearance_content
+        )
+        logger.info(f"BA BDR intake paused at DOCUMENT_CLEARANCE (workflow_id={workflow_id})")
+
+        return json.dumps({
+            "doc_id": doc_id, "workflow_id": workflow_id, "filename": filename,
+            "row_count": len(raw_rows), "pii_tokens_redacted": len(combined_map),
+            "status": "pending_clearance",
+            "next": f"After approval run: complete_ba_data_analysis --doc-id {doc_id}"
+        }, indent=2), workflow_state
+
+    def complete_ba_data_analysis(self, doc_id: str) -> str:
+        """BA Agent extracts schema and requirements from a cleared BDR document."""
+        self.db.cursor.execute("SELECT * FROM bdr_documents WHERE doc_id = ?", (doc_id,))
+        row = self.db.cursor.fetchone()
+        if not row:
+            return f"ERROR: Document {doc_id} not found"
+
+        _, filename, file_type, row_count, extracted_fields, \
+            _, clearance_wf_id, status, ingested_at, _ = row
+
+        if status == "pending_clearance":
+            return f"ERROR: Document {doc_id} not yet cleared (still at DOCUMENT_CLEARANCE gate)."
+
+        redacted_sample = json.loads(extracted_fields or "[]")
+        workflow_id = f"ba_analysis_{doc_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        output, call, confidence = self._call_claude(
+            agent_name="ba_agent",
+            system_prompt=(
+                "You are a Business Analyst Agent for First Genesis. "
+                "Analyze business data documents to extract schemas, data requirements, "
+                "and dependency maps. Output ONLY valid JSON. "
+                "Sections marked [HUMAN_ONLY] must be empty strings."
+            ),
+            user_message=f"""Analyze this cleared BDR document and extract structured requirements.
+Filename: {filename} | Rows: {row_count} | Type: {file_type}
+Redacted sample: {json.dumps(redacted_sample, indent=2)}
+
+Output JSON only:
+{{
+  "schema": {{"field_name": "inferred_type"}},
+  "data_quality": {{"completeness_pct": 95, "issues": []}},
+  "requirements_extracted": [
+    {{"id": "DR1", "description": "...", "source_field": "..."}}
+  ],
+  "sme_review_fields": [],
+  "dependency_map": {{
+    "upstream": [], "downstream": [], "missing": []
+  }},
+  "integration_design": "[HUMAN_ONLY]",
+  "technical_data_flow": "[HUMAN_ONLY]",
+  "confidence": 4
+}}""",
+            workflow_id=workflow_id,
+            scaffold_mode=True
+        )
+
+        if not output:
+            return f"ERROR: BA Agent data analysis failed: {call.reason}"
+
+        self.db.cursor.execute(
+            "UPDATE bdr_documents SET status = 'analyzed', cleared_at = ? WHERE doc_id = ?",
+            (datetime.now().isoformat(), doc_id)
+        )
+        self.db.conn.commit()
+        logger.info(f"BA Agent completed data analysis for {filename} (confidence={confidence}/5)")
+        return output
+
+    def get_bdr_queue_status(self) -> str:
+        """Return a summary of all BDR documents in the pipeline."""
+        self.db.cursor.execute("""
+            SELECT status, COUNT(*) as cnt, MAX(ingested_at) as latest
+            FROM bdr_documents GROUP BY status
+        """)
+        rows = self.db.cursor.fetchall()
+        lines = ["\n" + "="*70, "BA AGENT — BDR DOCUMENT QUEUE", "="*70]
+        if not rows:
+            lines.append("  No documents ingested yet.")
+        for status, count, latest in rows:
+            lines.append(f"  {status:30} {count:>3} doc(s)  latest: {latest}")
+
+        # Flag documents stuck in clearance > 4 hours
+        self.db.cursor.execute("""
+            SELECT filename, ingested_at FROM bdr_documents WHERE status = 'pending_clearance'
+        """)
+        alerts = []
+        for fname, ingested_at in self.db.cursor.fetchall():
+            try:
+                age_h = (datetime.now() - datetime.fromisoformat(ingested_at)).total_seconds() / 3600
+                if age_h > 4:
+                    alerts.append(f"  [STALE] '{fname}' waiting {age_h:.1f}h for clearance approval")
+            except (ValueError, TypeError):
+                pass
+        if alerts:
+            lines.append(f"\nALERTS ({len(alerts)}):")
+            lines.extend(alerts)
+        else:
+            lines.append("\n  No stale documents.")
+        lines.append("="*70 + "\n")
+        return "\n".join(lines)
 
     def submit_sme_correction(self, agent_name: str, original_output_hash: str,
                               original_snippet: str, corrected_content: str,
@@ -2298,7 +2586,7 @@ class AgentCostModel:
     """Realistic token costs for each agent type."""
 
     PM_AGENT     = {"name": "PM Agent",           "input_tokens": 3500, "output_tokens": 1200, "calls_per_day": 2, "description": "Project setup, WBS, status tracking"}
-    BA_AGENT     = {"name": "BA Agent",           "input_tokens": 6000, "output_tokens": 1500, "calls_per_day": 1, "description": "Design sessions, requirements, traceability"}
+    BA_AGENT     = {"name": "BA Agent",           "input_tokens": 7000, "output_tokens": 1800, "calls_per_day": 3, "description": "Requirements, design sessions, data intake, schema extraction, dependency mapping"}
     QA_AGENT     = {"name": "QA Agent",           "input_tokens": 8000, "output_tokens": 2000, "calls_per_day": 1, "description": "Pre-delivery audit, scope creep detection"}
     VENDOR_AGENT = {"name": "Vendor Agent",       "input_tokens": 4000, "output_tokens":  800, "calls_per_day": 1, "description": "Partner SLA tracking, performance monitoring"}
     MANAGER_AGENT= {"name": "Manager Agent",      "input_tokens": 5000, "output_tokens": 1500, "calls_per_day": 1, "description": "Portfolio dashboard, orchestration"}
@@ -2556,6 +2844,12 @@ def main():
         print("Usage: python claude_code_agent_ecosystem.py [command]")
         print("\nAgent Commands:")
         print("  run_pm_agent              Run PM Agent with approval gate (scaffold mode)")
+        print("  run_ba_requirements       Run BA Agent requirements extraction")
+        print("  run_ba_bdr_intake         Ingest BDR document (CSV/Excel) via BA Agent")
+        print("    --file <path>           Path to CSV or Excel file")
+        print("  complete_ba_data_analysis Complete BA data analysis after clearance")
+        print("    --doc-id <id>           BDR document ID from run_ba_bdr_intake")
+        print("  bdr_queue                 Show BDR document intake queue status")
         print("  check_approvals           Show pending approvals")
         print("  resume_workflows          Resume approved workflows")
         print("  process_approval          Process approval response")
@@ -2750,6 +3044,60 @@ def main():
         agent.hallucination_guard.add_frozen_fact(**kwargs)
         print(f"\nFrozen fact added: {kwargs['key']} = {kwargs['value']} (by {kwargs['added_by']})")
         print(f"Active facts: {len(agent.hallucination_guard.FROZEN_FACTS)}")
+
+    elif command == "run_ba_requirements":
+        logger.info("Running BA Agent requirements extraction...")
+        try:
+            result = agent.run_ba_agent_requirements()
+            print(result)
+        except Exception as e:
+            logger.error(f"Error: {str(e)}")
+            print(f"ERROR: {str(e)}")
+
+    elif command == "run_ba_bdr_intake":
+        filepath = None
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--file" and i + 1 < len(sys.argv):
+                filepath = sys.argv[i + 1]; i += 2
+            else:
+                i += 1
+        if not filepath:
+            print("ERROR: --file <path> is required")
+            sys.exit(1)
+        logger.info(f"Running BA BDR intake on: {filepath}")
+        try:
+            result = agent.run_ba_agent_bdr_intake(filepath)
+            print(result)
+        except Exception as e:
+            logger.error(f"Error: {str(e)}")
+            print(f"ERROR: {str(e)}")
+
+    elif command == "complete_ba_data_analysis":
+        doc_id = None
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--doc-id" and i + 1 < len(sys.argv):
+                doc_id = sys.argv[i + 1]; i += 2
+            else:
+                i += 1
+        if not doc_id:
+            print("ERROR: --doc-id <id> is required")
+            sys.exit(1)
+        logger.info(f"Completing BA data analysis for doc: {doc_id}")
+        try:
+            result = agent.complete_ba_data_analysis(doc_id)
+            print(result)
+        except Exception as e:
+            logger.error(f"Error: {str(e)}")
+            print(f"ERROR: {str(e)}")
+
+    elif command == "bdr_queue":
+        try:
+            print(agent.get_bdr_queue_status())
+        except Exception as e:
+            logger.error(f"Error: {str(e)}")
+            print(f"ERROR: {str(e)}")
 
     elif command == "env_status":
         print(f"\n{'='*70}")

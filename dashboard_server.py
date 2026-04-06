@@ -758,6 +758,43 @@ def api_delete_frozen_fact(fact_key: str):
 # ============================================================================
 # ENVIRONMENT STATUS API
 # ============================================================================
+@app.route("/api/bdr-queue", methods=["GET"])
+def api_bdr_queue():
+    """Return BDR document intake queue status (managed by BA Agent)."""
+    try:
+        from claude_code_agent_ecosystem import AutonomousAgentWithEmailGates
+        agent = AutonomousAgentWithEmailGates()
+        status_text = agent.get_bdr_queue_status()
+
+        # Also return raw rows for dashboard rendering
+        agent.db.cursor.execute(
+            """SELECT doc_id, filename, file_type, row_count, status,
+                      ingested_at, clearance_workflow_id
+               FROM bdr_documents ORDER BY ingested_at DESC LIMIT 50"""
+        )
+        rows = agent.db.cursor.fetchall()
+        documents = [
+            {
+                "doc_id": r[0],
+                "filename": r[1],
+                "file_type": r[2],
+                "row_count": r[3],
+                "status": r[4],
+                "ingested_at": r[5],
+                "clearance_workflow_id": r[6],
+            }
+            for r in rows
+        ]
+        return jsonify({
+            "summary": status_text,
+            "documents": documents,
+            "total": len(documents),
+            "agent": "ba_agent",
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/environment", methods=["GET"])
 def api_environment_status():
     """Return the current ecosystem environment configuration."""
